@@ -142,8 +142,73 @@ static void test_reveal_and_reorder(void)
     }
 }
 
+static void test_motion_helpers(void)
+{
+    double v=0, lefts[3]={0,412,1024}, widths[3]={400,600,500};
+    /* Springs start at the source, keep the given velocity, and settle. */
+    assert(hstrip_spring_damped(10,90,0,0,30,1,&v)==10 && v==0);
+    assert(fabs(hstrip_spring_damped(10,90,0,5,30,.6,&v)-90)<1e-6 && fabs(v)<1e-6);
+    hstrip_spring_damped(0,100,250,0,30,.6,&v); assert(fabs(v-250)<1e-9);
+    {
+        double peak=0;
+        for(int i=0;i<400;i++) peak=fmax(peak,hstrip_spring_damped(0,100,0,i/400.0,30,.5,&v));
+        assert(peak>100.5 && peak<125); /* an underdamped spring overshoots, boundedly */
+    }
+    assert(fabs(hstrip_spring(0,600,0,.38,hstrip_spring_omega(.38,1),&v)-600)<.25);
+    assert(hstrip_spring_progress(0,.3)==0 && hstrip_spring_progress(.3,.3)==1);
+    assert(hstrip_spring_progress(.1,.3)>.5 && hstrip_spring_progress(.1,.3)<1);
+    /* Rubber banding is monotonic and never reaches its limit. */
+    assert(hstrip_rubber_band(0,300)==0 && hstrip_rubber_band(-5,300)==0);
+    assert(hstrip_rubber_band(100,300)<100 && hstrip_rubber_band(100,300)>0);
+    assert(hstrip_rubber_band(1e9,300)<300 && hstrip_rubber_band(200,300)>hstrip_rubber_band(100,300));
+    /* Snap chooses the nearest flush edge, respects the wall and the reach. */
+    assert(hstrip_snap_offset(390,1000,lefts,widths,3,200)==412);
+    assert(hstrip_snap_offset(4,1000,lefts,widths,3,200)==0);
+    assert(hstrip_snap_offset(40,1000,lefts,widths,3,200)==12); /* second column flush right */
+    assert(hstrip_snap_offset(500,1000,lefts,widths,3,200)==524); /* right edge of the last column */
+    assert(hstrip_snap_offset(5000,1000,lefts,widths,3,200)==5000);
+    assert(hstrip_snap_offset(-20,1000,NULL,NULL,0,200)==0);
+    /* Centre snapping: nearest centred column; the first cannot pass the wall. */
+    assert(hstrip_snap_center(150,1000,lefts,widths,3)==212);  /* (412+300)-500 */
+    assert(hstrip_snap_center(20,1000,lefts,widths,3)==0);
+    assert(hstrip_snap_center(900,1000,lefts,widths,3)==774);  /* (1024+250)-500 */
+    {
+        double wide_left[1]={300}, wide_width[1]={1600};
+        assert(hstrip_snap_center(500,1000,wide_left,wide_width,1)==300); /* too wide to centre */
+    }
+    assert(hstrip_snap_center(-9,1000,NULL,NULL,0)==0);
+    {
+        /* Directional snapping: a short committed swipe moves on, a twitch returns. */
+        double rests[4]={0,212,774,1524};
+        assert(hstrip_snap_directional(212,212+80,rests,4,.2)==212);    /* 80 of 562: under 20% */
+        assert(hstrip_snap_directional(212,212+130,rests,4,.2)==774);   /* over 20%: next column */
+        assert(hstrip_snap_directional(212,212-50,rests,4,.2)==0);      /* 50 of 212 leftwards */
+        assert(hstrip_snap_directional(212,212+1200,rests,4,.2)==1524); /* a long flick goes further */
+        assert(hstrip_snap_directional(1524,1524+300,rests,4,.2)==1524);/* nothing beyond the end */
+        assert(hstrip_snap_directional(212,212+130,rests,4,.5)==212);   /* a stiffer setting holds */
+        assert(hstrip_snap_directional(400,400,rests,4,.2)==212);       /* no travel: nearest */
+        assert(hstrip_snap_directional(5,-3,NULL,0,.2)==0);
+    }
+    /* The magnet leans toward rest, is the identity outside its radius, and is monotonic. */
+    assert(hstrip_magnet(500,500,200,.3)==500 && hstrip_magnet(800,500,200,.3)==800);
+    assert(hstrip_magnet(540,500,200,.3)<540 && hstrip_magnet(540,500,200,.3)>500);
+    assert(hstrip_magnet(460,500,200,.3)>460 && hstrip_magnet(460,500,200,.3)<500);
+    for(int i=0;i<800;i++) assert(hstrip_magnet(100+i*.5+.5,300,200,.6)>hstrip_magnet(100+i*.5,300,200,.6));
+    /* The nearest boundary to a point, including both ends. */
+    assert(hstrip_nearest_gap(-50,lefts,widths,3,12)==0);
+    assert(hstrip_nearest_gap(420,lefts,widths,3,12)==1);
+    assert(hstrip_nearest_gap(1000,lefts,widths,3,12)==2);
+    assert(hstrip_nearest_gap(9000,lefts,widths,3,12)==3);
+    assert(hstrip_nearest_gap(100,lefts,widths,0,12)==0);
+    /* Closing: converge on a visible hole, absorb one to the left, ignore one to the right. */
+    assert(hstrip_close_shift(1200,400,1000,1000)==200);
+    assert(hstrip_close_shift(100,400,1000,1000)==400);
+    assert(hstrip_close_shift(2600,400,1000,1000)==0);
+}
+
 int main(void)
 {
+    test_motion_helpers();
     assert(hstrip_project_x(2000,1000,12,1000000)==1012);
     assert(hstrip_project_x(0,DBL_MAX,0,1000000)==-1000000);
     assert(hstrip_project_x(DBL_MAX,0,0,1000000)==1000000);

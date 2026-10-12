@@ -28,6 +28,14 @@ test:
 	./build/overview_geometry_test
 	$(CC) -std=c11 -Wall -Wextra -Werror -fsanitize=address,undefined -g tests/strip_runtime_test.m -framework Cocoa -o build/strip_runtime_test
 	./build/strip_runtime_test
+	$(CC) -std=c11 -Wall -Wextra -Werror -fno-objc-arc tests/overview_input_test.m -framework Cocoa -framework QuartzCore -o build/overview_input_test
+	./build/overview_input_test
+	$(CC) -Wall -Wextra -Werror -fno-objc-arc -framework Cocoa -I src src/tana_config.m tests/tana_config_test.m -o build/tana_config_test
+	./build/tana_config_test
+	$(CC) -std=c11 -Wall -Wextra -Werror -fsanitize=address,undefined tests/strip_workflow_model_test.c -o build/strip_workflow_model_test
+	./build/strip_workflow_model_test
+	$(CC) -std=c11 -Wall -Wextra -Werror -fno-objc-arc -fsanitize=address,undefined tests/strip_workflow_runtime_test.m -framework Cocoa -o build/strip_workflow_runtime_test
+	./build/strip_workflow_runtime_test
 	python3 -m unittest discover -s tests -p 'test_*.py'
 bench:
 	mkdir -p build

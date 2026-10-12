@@ -768,6 +768,8 @@ static EVENT_HANDLER(WINDOW_RESIZED)
         return;
     }
 
+    // The strip owns this geometry; do not query the application about its own echo.
+    if (horizontal_resize_event(window)) return;
     CGRect new_frame = window_ax_frame(window);
     if (CGRectEqualToRect(new_frame, window->frame)) {
         debug("%s:DEBOUNCED %s %d\n", __FUNCTION__, window->application->name, window->id);
@@ -1190,6 +1192,7 @@ static EVENT_HANDLER(MOUSE_DOWN)
         if (point.y > frame_mid.y) g_mouse_state.direction |= HANDLE_BOTTOM;
     }
 
+    horizontal_mouse_down(window, point);
 out:
     CFRelease(context);
 }
@@ -1279,6 +1282,7 @@ out:
 
 static EVENT_HANDLER(MOUSE_DRAGGED)
 {
+    horizontal_dragged_queued = false;
     firefox_discovery_drag();
     if (horizontal_drag(context)) goto out;
     if (mission_control_is_active()) goto out;
@@ -1394,6 +1398,7 @@ out:
 
 static EVENT_HANDLER(MOUSE_MOVED)
 {
+    horizontal_moved_queued = false;
     if (g_window_manager.ffm_mode == FFM_DISABLED) goto out;
     if (menu_focus_suppressed()) goto out;
     if (mission_control_is_active())               goto out;

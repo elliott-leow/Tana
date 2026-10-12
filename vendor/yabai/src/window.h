@@ -105,6 +105,8 @@ struct window
     char *scratchpad;
     double strip_width, strip_saved_width, strip_world_x, strip_from_x, strip_from_width, strip_start;
     uint64_t strip_column;
+    double strip_min_width;
+    uint32_t strip_rule_anchor;
     double strip_weight,strip_world_y,strip_from_y,strip_height,strip_from_height;
     CGRect strip_float_restore;
     CGRect strip_float_from, strip_float_target, strip_float_last;
@@ -116,13 +118,21 @@ struct window
     bool strip_float_full,strip_ordered_out;
     CGRect strip_last_frame;
     double strip_last_offset;
-    bool strip_initialized, strip_full_width;
+    bool strip_initialized, strip_full_width, strip_tab_parked;
     bool strip_size_pending;
     double strip_size_sent_at;
     CGRect strip_original_frame;
     uint64_t strip_original_space;
     int strip_original_layer;
     bool strip_remembered;
+    double strip_vel_x, strip_vel_y, strip_vel_width, strip_vel_height;
+    double strip_pop_start;
+    int strip_pop; /* 0 none, 1 opening */
+    bool strip_pop_scaled, strip_close_scaled, strip_placed;
+    bool strip_close_ghost; /* vacated its place in the strip while it fades out */
+    double strip_ghost_time;
+    float strip_alpha; /* opacity Tana last requested; 0 means untouched */
+    CGRect strip_float_saved;
 };
 
 enum window_flag
