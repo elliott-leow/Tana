@@ -167,6 +167,67 @@ done:
 }
 
 /*
+ * Several messages, one wait. The helper serves one connection at a time and
+ * in the order they were made, so a frame's commands can all be handed over
+ * before any is acknowledged: the helper works through them back to back
+ * instead of the two processes waking each other once per command. Commands
+ * are applied in the order they were queued. A queued message is not known to
+ * have been applied until hwm_sa_pipeline_flush returns.
+ */
+#define HWM_SA_PIPELINE_MAX 48 /* stays well inside the helper's listen backlog */
+typedef struct {
+    int descriptors[HWM_SA_PIPELINE_MAX];
+    int count;
+    long long deadline;
+    bool failed;
+} HwmSaPipeline;
+
+/* Wait for every queued message to be acknowledged. False when any message in
+ * the batch, including one that could not be queued, did not get through. */
+static inline bool hwm_sa_pipeline_flush(HwmSaPipeline *pipeline)
+{
+    bool success;
+    int index;
+    for (index = 0; index < pipeline->count; ++index) {
+        int fd = pipeline->descriptors[index];
+        for (;;) {
+            unsigned char acknowledgement;
+            ssize_t received;
+            if (!hwm_sa_wait(fd, POLLIN | POLLHUP, pipeline->deadline)) { pipeline->failed = true; break; }
+            received = recv(fd, &acknowledgement, sizeof(acknowledgement), 0);
+            if (received >= 0) break;
+            if (errno != EINTR && errno != EAGAIN && errno != EWOULDBLOCK) { pipeline->failed = true; break; }
+        }
+        close(fd);
+    }
+    success = !pipeline->failed;
+    pipeline->count = 0;
+    pipeline->failed = false;
+    return success;
+}
+
+/* Queue one message. The batch shares a single deadline, set by its first message. */
+static inline bool hwm_sa_pipeline_send(HwmSaPipeline *pipeline, const char *path, const void *bytes, size_t length, int timeout_ms)
+{
+    int fd;
+    if (path == NULL || (bytes == NULL && length != 0U) || timeout_ms <= 0) { pipeline->failed = true; return false; }
+    if (pipeline->count >= HWM_SA_PIPELINE_MAX && !hwm_sa_pipeline_flush(pipeline)) pipeline->failed = true;
+    if (pipeline->count == 0) {
+        long long start = hwm_sa_monotonic_ms();
+        if (start < 0 || start > LLONG_MAX - timeout_ms) { pipeline->failed = true; return false; }
+        pipeline->deadline = start + timeout_ms;
+    }
+    fd = hwm_sa_connect(path, pipeline->deadline);
+    if (fd < 0 || !hwm_sa_send_all(fd, bytes, length, pipeline->deadline)) {
+        if (fd >= 0) close(fd);
+        pipeline->failed = true;
+        return false;
+    }
+    pipeline->descriptors[pipeline->count++] = fd;
+    return true;
+}
+
+/*
  * Send a caller-supplied handshake request and read the native SA reply:
  * a nonempty NUL-terminated version string followed by a uint32_t attribute
  * field.  Version capacity includes the terminating NUL.

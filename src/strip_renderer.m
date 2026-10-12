@@ -1,9 +1,11 @@
 /* Serialized rendering and delayed-notification handling. */
 static bool hwm_view_in_motion(struct view *view,double now);
+static double hwm_rendered_offset; // Camera position of the frame last drawn.
 static bool hwm_render(struct view *view, double now)
 {
     CGRect bounds = hwm_bounds(view);
     double offset = hwm_offset(view, now);
+    hwm_rendered_offset = offset;
     bool active = view->strip_scrolling;
     bool batched=false;
     // While the strip is travelling, a window that is off screen before and
@@ -83,6 +85,7 @@ static bool hwm_render(struct view *view, double now)
                 } else {
                     window->strip_size_pending = false;
                     CGRect actual = CGRectNull;
+                    hwm_batch_settle();
                     bool measured=SLSGetWindowBounds(g_connection,window->id,&actual)==kCGErrorSuccess;
                     if(measured && !CGPointEqualToPoint(actual.origin,frame.origin))
                         scripting_addition_move_window(window->id,frame.origin.x,frame.origin.y);

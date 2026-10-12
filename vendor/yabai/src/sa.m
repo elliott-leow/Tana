@@ -400,9 +400,33 @@ out:
 #define pack(v) memcpy(bytes+length, &v, sizeof(v)); length += sizeof(v)
 #define sa_payload_send(op) *(int16_t*)bytes = length-sizeof(length), bytes[sizeof(length)] = op, scripting_addition_send_bytes(bytes, length)
 
+// Between begin and end, commands sent from this thread are handed to the
+// helper without waiting for each one; end waits for all of them together.
+static __thread HwmSaPipeline hwm_sa_pipeline;
+static __thread int hwm_sa_batch_depth;
+
+void scripting_addition_batch_begin(void)
+{
+    ++hwm_sa_batch_depth;
+}
+
+// Wait until everything queued so far has been applied, leaving the batch open.
+bool scripting_addition_batch_flush(void)
+{
+    return hwm_sa_pipeline_flush(&hwm_sa_pipeline);
+}
+
+bool scripting_addition_batch_end(void)
+{
+    if (hwm_sa_batch_depth > 0) --hwm_sa_batch_depth;
+    return hwm_sa_batch_depth > 0 ? true : hwm_sa_pipeline_flush(&hwm_sa_pipeline);
+}
+
 static bool scripting_addition_send_bytes(char *bytes, int length)
 {
-    return length > 0 && hwm_sa_send(g_sa_socket_file, bytes, (size_t) length, 50);
+    if (length <= 0) return false;
+    if (hwm_sa_batch_depth > 0) return hwm_sa_pipeline_send(&hwm_sa_pipeline, g_sa_socket_file, bytes, (size_t) length, 50);
+    return hwm_sa_send(g_sa_socket_file, bytes, (size_t) length, 50);
 }
 
 bool scripting_addition_focus_space(uint64_t sid)

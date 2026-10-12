@@ -287,8 +287,107 @@ static void test_malformed_handshakes_fail(void)
     handshake_server_join(&server);
 }
 
+/* A helper that serves one connection at a time, in the order they were made,
+ * like the real one: read a one-byte message, record it, close. */
+struct pipeline_server {
+    pthread_t thread;
+    int listener;
+    char path[104];
+    int expected;
+    int stall_after; /* stop answering after this many messages; -1 never */
+    unsigned char order[160];
+    int served;
+};
+
+static void *pipeline_server_main(void *context)
+{
+    struct pipeline_server *server = context;
+    int held[160]; int held_count = 0;
+    while (server->served < server->expected) {
+        unsigned char byte;
+        int client = accept(server->listener, NULL, NULL);
+        if (client < 0) break;
+        if (recv(client, &byte, 1U, MSG_WAITALL) == 1) server->order[server->served] = byte;
+        ++server->served;
+        if (server->stall_after >= 0 && server->served > server->stall_after) { held[held_count++] = client; continue; }
+        close(client);
+    }
+    if (held_count) usleep(150000);
+    while (held_count) close(held[--held_count]);
+    close(server->listener);
+    unlink(server->path);
+    return NULL;
+}
+
+static void pipeline_server_start(struct pipeline_server *server, int expected, int stall_after)
+{
+    struct sockaddr_un address;
+    memset(server, 0, sizeof(*server));
+    server->expected = expected; server->stall_after = stall_after;
+    assert(snprintf(server->path, sizeof(server->path), "/tmp/hwm-sa-%ld-%u.socket", (long) getpid(), ++path_counter) > 0);
+    server->listener = socket(AF_UNIX, SOCK_STREAM, 0);
+    assert(server->listener >= 0);
+    memset(&address, 0, sizeof(address));
+    address.sun_family = AF_UNIX;
+    memcpy(address.sun_path, server->path, strlen(server->path) + 1U);
+    assert(bind(server->listener, (const struct sockaddr *) &address, sizeof(address)) == 0);
+    assert(listen(server->listener, 128) == 0);
+    assert(pthread_create(&server->thread, NULL, pipeline_server_main, server) == 0);
+}
+
+static void test_pipeline_orders_and_awaits_every_message(void)
+{
+    struct pipeline_server server;
+    HwmSaPipeline pipeline;
+    int baseline = descriptor_count();
+    int count = HWM_SA_PIPELINE_MAX * 2 + 7; /* crosses the queue limit twice */
+    int index;
+    memset(&pipeline, 0, sizeof(pipeline));
+    pipeline_server_start(&server, count, -1);
+    for (index = 0; index < count; ++index) {
+        unsigned char byte = (unsigned char) index;
+        assert(hwm_sa_pipeline_send(&pipeline, server.path, &byte, 1U, 2000));
+        assert(pipeline.count <= HWM_SA_PIPELINE_MAX);
+    }
+    assert(hwm_sa_pipeline_flush(&pipeline));
+    assert(pipeline.count == 0 && !pipeline.failed);
+    assert(pthread_join(server.thread, NULL) == 0);
+    assert(server.served == count);
+    for (index = 0; index < count; ++index) assert(server.order[index] == (unsigned char) index);
+    /* An empty flush is a successful no-op. */
+    assert(hwm_sa_pipeline_flush(&pipeline));
+    assert(descriptor_count() == baseline);
+}
+
+static void test_pipeline_reports_unanswered_and_unsendable(void)
+{
+    struct pipeline_server server;
+    HwmSaPipeline pipeline;
+    int baseline = descriptor_count();
+    unsigned char byte = 1;
+    long long start;
+    memset(&pipeline, 0, sizeof(pipeline));
+    /* The second and third messages are read but never acknowledged in time. */
+    pipeline_server_start(&server, 3, 1);
+    assert(hwm_sa_pipeline_send(&pipeline, server.path, &byte, 1U, 60));
+    assert(hwm_sa_pipeline_send(&pipeline, server.path, &byte, 1U, 60));
+    assert(hwm_sa_pipeline_send(&pipeline, server.path, &byte, 1U, 60));
+    start = hwm_sa_monotonic_ms();
+    assert(!hwm_sa_pipeline_flush(&pipeline));
+    assert(hwm_sa_monotonic_ms() - start < 120); /* one shared deadline, not one per message */
+    assert(pipeline.count == 0 && !pipeline.failed);
+    assert(pthread_join(server.thread, NULL) == 0);
+    /* Nothing is listening: the send fails, and so does the batch it belonged to. */
+    assert(!hwm_sa_pipeline_send(&pipeline, "/tmp/hwm-sa-does-not-exist.socket", &byte, 1U, 60));
+    assert(!hwm_sa_pipeline_flush(&pipeline));
+    assert(hwm_sa_pipeline_flush(&pipeline)); /* the failure does not outlive its batch */
+    assert(descriptor_count() == baseline);
+}
+
 int main(void)
 {
+    test_pipeline_orders_and_awaits_every_message();
+    test_pipeline_reports_unanswered_and_unsendable();
     test_send_fast_path_and_backpressure();
     test_eof_and_partial_server_reads();
     test_optional_ack();

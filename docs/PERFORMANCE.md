@@ -75,3 +75,67 @@ renderer; CPU microbenchmarks do not remove that platform constraint. The
 manager releases compositor suppression before any AX sizing call. Performance
 with unresponsive applications, multiple displays, wake, and Dock restart still
 requires separate live acceptance testing.
+
+## Frame pacing pass (2026-10-12)
+
+The earlier passes measured how long a frame takes to compute. That number was
+already small and did not explain a swipe that sometimes lagged, so this pass
+measured pacing instead: when frames are drawn, what delays them, and how
+evenly the strip advances. `strip pacing` reports tick latency, dropped frames
+and the cost of every event-loop handler; `strip frame-log` returns the camera
+position of recent frames next to the swipe reports that drove them.
+`pacing-reset` clears both.
+
+All figures are from the development Mac (60 Hz built-in display) with the
+user's own windows, driven by synthetic three-finger swipes posted as Dock
+gesture events with accurate timestamps. Physical swipes were not measured.
+
+| Finding | Before | After |
+| --- | --- | --- |
+| Per-frame step of a steady held swipe, standard deviation over mean, reports every 11 ms | 0.33 | 0.10 |
+| Same, reports every 13.5 ms | 0.34 | 0.10 |
+| Housekeeping sweep on the frame thread during a swipe | 2 to 3 ms, ten times a second, up to 10 ms | does not run while frames are drawn |
+| Housekeeping sweep with the desktop at rest | about 3% of one core | twice a second |
+| Frame thread scheduling priority | 31 (default) | 46 (user-interactive) |
+| Stall when focus follows a swipe | 8 to 16 ms | 5 to 9 ms |
+| Overview opening, frames over 8 ms of about 310 | 40 to 58 | 1 to 11 |
+
+What changed:
+
+- **Held swipes are drawn where the fingers are at the frame.** Finger reports
+  and display refreshes are not in step, so a frame followed one report, two,
+  or none, and a steady swipe advanced 16, 48, 16, 48 points. Each frame now
+  carries the strip on from a line fitted through the last 50 ms of reports,
+  for at most 12 ms past the newest. Speeds are measured between the reports'
+  own timestamps rather than the times this process got to them. The overview
+  gesture is resampled the same way.
+- **The frame thread runs at user-interactive priority** and the process opts
+  out of App Nap.
+- **Helper commands of a frame are handed over together and awaited once.**
+  Eight sequential moves cost a median 0.82 ms against the live helper; the
+  same eight pipelined cost 0.38 ms. An overview frame sends two per card.
+- **The housekeeping sweep waits while frames are drawn**, runs at 10 Hz for a
+  second afterwards (when a correction can be needed) and at 2 Hz at rest.
+  WindowServer already reports ordering changes as they happen.
+- **Blocking Accessibility round trips left the frame thread.** A window's
+  title is fetched when something asks for it, not on every title change, and
+  an activation Tana requested no longer asks the application which window it
+  focused.
+- **The usable-screen rectangle is cached** until the display, Dock or menu bar
+  reports a change, and is never refreshed mid-swipe.
+- **Saving the layout writes on its own queue**, not at the end of every glide.
+- **The overview's scrim is faded by the helper on its own clock.** Setting the
+  blurred window's opacity from this process every frame, to follow the
+  fingers, was the cause of nearly all slow overview frames: with the scrim
+  disabled the same test showed none. The scrim now fades in once when the
+  overview opens and out when it closes; it no longer tracks the fingers.
+  The outline and captions are drawn at the cards' resting places and shown as
+  the cards arrive, instead of being redrawn under every frame of the flight.
+- **Opening the overview no longer waits for the main thread** to raise the
+  overlay, and the overlay's windows are built at startup.
+- **The frame clock stops while a native fullscreen Space is in front**, and
+  the idle fallback timer runs at 10 Hz instead of 60 Hz.
+
+Not improved: each card of the overview still costs two helper commands per
+frame, each of which is three WindowServer round trips inside Dock. Removing
+that needs a new helper opcode and a reinstall of the scripting addition.

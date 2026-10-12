@@ -18,18 +18,31 @@ static int hwm_batch_depth;
 static bool hwm_batch_open, hwm_batch_hold;
 static void hwm_batch_begin(void)
 {
-    if(!hwm_batch_open) { SLSDisableUpdate(g_connection); hwm_batch_open=true; }
+    // The helper commands of a batch are handed over together and awaited
+    // once, just before the batch is presented.
+    if(!hwm_batch_open) { SLSDisableUpdate(g_connection); scripting_addition_batch_begin(); hwm_batch_open=true; }
     ++hwm_batch_depth;
+}
+static void hwm_batch_present(void)
+{
+    if(!scripting_addition_batch_end()) { hwm_backend_ok=false; ++hwm_move_failures; }
+    SLSReenableUpdate(g_connection); hwm_batch_open=false;
 }
 static void hwm_batch_end(void)
 {
     if(hwm_batch_depth>0) --hwm_batch_depth;
-    if(!hwm_batch_depth && !hwm_batch_hold && hwm_batch_open) { SLSReenableUpdate(g_connection); hwm_batch_open=false; }
+    if(!hwm_batch_depth && !hwm_batch_hold && hwm_batch_open) hwm_batch_present();
 }
 static void hwm_batch_release(void)
 {
     hwm_batch_hold=false;
-    if(!hwm_batch_depth && hwm_batch_open) { SLSReenableUpdate(g_connection); hwm_batch_open=false; }
+    if(!hwm_batch_depth && hwm_batch_open) hwm_batch_present();
+}
+/* WindowServer is about to be asked where a window is: anything this batch
+ * has queued for the helper must have been applied first. */
+static void hwm_batch_settle(void)
+{
+    if(hwm_batch_open && !scripting_addition_batch_flush()) { hwm_backend_ok=false; ++hwm_move_failures; }
 }
 /* A column about to leave the strip. Once layout has closed the hole the camera
  * follows by hstrip_close_shift, so the neighbours on both sides converge

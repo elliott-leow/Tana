@@ -15,6 +15,7 @@ extern volatile bool __pending_gesture;
 extern volatile uint64_t __last_gesture_time;
 
 static _Atomic bool hwm_ready, hwm_paused;
+static double hwm_screen_stamp=-10; // Usable-screen cache; reset whenever the display, Dock or menu bar reports a change.
 static bool hwm_backend_ok = true;
 static uint64_t hwm_space;
 static CVDisplayLinkRef hwm_display_link;
@@ -38,6 +39,49 @@ static bool hwm_tab_click;
 static double hwm_duration = 0.36; // Settle horizon of the tile springs.
 static double hwm_scroll_omega = 22;
 static double hwm_rubber; // Signed overscroll shown while a finger holds the strip past an end.
+/* Finger reports and display refreshes are not in step: a frame can follow one
+ * report, two, or none, so a steady swipe drawn straight from the latest
+ * report advances in uneven steps. Each frame of a held swipe is instead drawn
+ * where the fingers are at that frame, carried on from the latest report at
+ * the speed they were moving, for no longer than about one report interval. */
+static double hwm_held_velocity, hwm_held_time, hwm_held_lead;
+static const double HWMHeldLeadMax=.012;
+/* The last few reports of the swipe in hand. Reports reach this process
+ * bunched and late by varying amounts, so one report and its neighbour are a
+ * poor measure of speed; a line through the last twentieth of a second is not. */
+enum { HWM_HELD_SAMPLES=6 };
+static struct { double time, offset; } hwm_held_samples[HWM_HELD_SAMPLES];
+static int hwm_held_count;
+static void hwm_held_note(double time,double offset)
+{
+    if(hwm_held_count==HWM_HELD_SAMPLES) memmove(hwm_held_samples,hwm_held_samples+1,(HWM_HELD_SAMPLES-1)*sizeof(*hwm_held_samples));
+    else ++hwm_held_count;
+    hwm_held_samples[hwm_held_count-1].time=time; hwm_held_samples[hwm_held_count-1].offset=offset;
+}
+/* Where the fingers have brought the strip by `time`, less the latest report. */
+static double hwm_held_lead_at(double time,double latest)
+{
+    if(hwm_held_count<2) return 0;
+    double newest=hwm_held_samples[hwm_held_count-1].time, st=0, sx=0, stt=0, stx=0; int n=0;
+    for(int i=hwm_held_count-1;i>=0 && newest-hwm_held_samples[i].time<=.05;i--) {
+        double t=hwm_held_samples[i].time-newest, x=hwm_held_samples[i].offset;
+        st+=t; sx+=x; stt+=t*t; stx+=t*x; ++n;
+    }
+    double spread=n*stt-st*st;
+    if(n<2 || !(spread>1e-9)) return 0;
+    double speed=(n*stx-st*sx)/spread, at_newest=(sx-speed*st)/n;
+    hwm_held_velocity=speed;
+    double ahead=fmax(0,fmin(HWMHeldLeadMax,time-newest));
+    // Never further from the latest report than the fingers could have travelled since.
+    double lead=at_newest+speed*ahead-latest, limit=fabs(speed)*(HWMHeldLeadMax+.004);
+    return fmax(-limit,fmin(limit,lead));
+}
+/* When a trackpad report was made, rather than when this thread got to it. */
+static double hwm_event_time(CGEventRef event,double now)
+{
+    double stamp=(double)CGEventGetTimestamp(event)/1e9;
+    return stamp<=now && now-stamp<.05 ? stamp : now;
+}
 static int hwm_snap = 2; // 0 free, 1 column edges, 2 centre the nearest column
 static double hwm_magnet = .1; // Pull toward a centred column while the strip is held.
 static double hwm_snap_threshold = .15; // Share of the way to the next column that commits a swipe to it.
@@ -83,6 +127,54 @@ static double hwm_prof[HWM_PROF_COUNT];
 static uint64_t hwm_prof_drag_ticks, hwm_prof_drag_events;
 static double hwm_now(void);
 static double hwm_prof_mark(int slot,double since) { double t=hwm_now(), ms=(t-since)*1000; if(ms>hwm_prof[slot]) hwm_prof[slot]=ms; return t; }
+/* Frame pacing, as opposed to frame cost: how long a tick waited to run after
+ * the display asked for it, how often an animating strip missed a refresh, and
+ * which other event-loop work held the frame thread up meanwhile. */
+static uint64_t hwm_tick_posted;
+static uint64_t hwm_tick_late, hwm_frames_dropped, hwm_stalls;
+static double hwm_tick_latency_max_ms, hwm_tick_latency_total_ms, hwm_frame_gap_max_ms, hwm_stall_max_ms;
+static double hwm_tick_previous; static bool hwm_tick_previous_active;
+static double hwm_drawn_time; // When a frame was last actually drawn.
+static int hwm_stall_type=-1;
+static struct { uint64_t count; double total_ms, max_ms; } hwm_event_prof[64];
+static const char *hwm_event_names[] = {
+#define EVENT_TYPE_ENTRY(value) #value,
+    EVENT_TYPE_LIST
+#undef EVENT_TYPE_ENTRY
+};
+enum { HWM_FRAME_LOG=1024 };
+static struct { double time, offset, tick_ms, latency_ms; } hwm_frame_log[HWM_FRAME_LOG];
+static struct { double time, offset; } hwm_input_log[HWM_FRAME_LOG];
+static uint64_t hwm_frame_log_count, hwm_input_log_count;
+static void horizontal_event_timed(int type,double ms)
+{
+    if(type<0 || type>=64) return;
+    if((type>=DISPLAY_ADDED && type<=DISPLAY_CHANGED) || type==SPACE_CHANGED || type==DOCK_DID_RESTART || type==MENU_BAR_HIDDEN_CHANGED ||
+       type==DOCK_DID_CHANGE_PREF || type==SYSTEM_WOKE) hwm_screen_stamp=-10;
+    ++hwm_event_prof[type].count; hwm_event_prof[type].total_ms+=ms;
+    if(ms>hwm_event_prof[type].max_ms) hwm_event_prof[type].max_ms=ms;
+    // Anything but a frame that takes this long while the strip is animating delays the next frame.
+    if(type!=HORIZONTAL_TICK && ms>2 && hwm_tick_previous_active) {
+        ++hwm_stalls;
+        if(ms>hwm_stall_max_ms) { hwm_stall_max_ms=ms; hwm_stall_type=type; }
+    }
+}
+static double hwm_tick_note(double now)
+{
+    uint64_t posted=__atomic_load_n(&hwm_tick_posted,__ATOMIC_RELAXED);
+    double latency=posted ? (now-(double)posted/(double)read_os_freq())*1000 : 0;
+    if(latency<0 || latency>1000) latency=0;
+    hwm_tick_latency_total_ms+=latency;
+    if(latency>4) ++hwm_tick_late;
+    if(latency>hwm_tick_latency_max_ms) hwm_tick_latency_max_ms=latency;
+    if(hwm_tick_previous_active) {
+        double gap=(now-hwm_tick_previous)*1000;
+        if(gap>25 && gap<1000) ++hwm_frames_dropped;
+        if(gap<1000 && gap>hwm_frame_gap_max_ms) hwm_frame_gap_max_ms=gap;
+    }
+    hwm_tick_previous=now;
+    return latency;
+}
 static CGPoint hwm_drag_move;
 static bool hwm_drag_move_pending;
 static void hwm_drag_autoscroll(struct view *view,double now);
@@ -113,6 +205,7 @@ static bool hwm_focus_after_scroll;
 static volatile sig_atomic_t hwm_stop_requested;
 static void hwm_shutdown(void);
 static void hwm_save_state(void);
+static void hwm_save_state_now(bool wait);
 static void hwm_load_state(void);
 static bool hwm_state_pending;
 static bool hwm_resume_load_state;
@@ -168,9 +261,14 @@ static struct view *hwm_view(void)
  * only when the Dock, menu bar or display does, so it is remembered briefly. */
 static CGRect hwm_screen(struct view *view)
 {
-    static uint64_t sid; static double stamp=-10; static CGRect frame;
+    static uint64_t sid; static CGRect frame;
     double now=hwm_now();
-    if(view->sid!=sid || now-stamp>.5) { sid=view->sid; stamp=now; frame=display_bounds_constrained(space_display_id(view->sid), false); }
+    // Never in the middle of a swipe or a glide: the answer cannot change
+    // there, and asking costs a frame's worth of round trips.
+    bool moving=view->strip_scrolling || __atomic_load_n(&__pending_gesture,__ATOMIC_RELAXED);
+    if(view->sid!=sid || (now-hwm_screen_stamp>2 && !(moving && hwm_screen_stamp>0))) {
+        sid=view->sid; hwm_screen_stamp=now; frame=display_bounds_constrained(space_display_id(view->sid), false);
+    }
     return frame;
 }
 static CGRect hwm_bounds(struct view *view)
@@ -193,7 +291,10 @@ static double hwm_clamp_offset(double offset)
  * view->strip_offset is always the clamped, in-bounds value. */
 static double hwm_offset(struct view *view, double now)
 {
-    if (!view->strip_scrolling) return view->strip_offset+hwm_rubber;
+    if (!view->strip_scrolling) {
+        if(hwm_held_lead==0 || hwm_rubber || !__atomic_load_n(&__pending_gesture,__ATOMIC_RELAXED)) return view->strip_offset+hwm_rubber;
+        return fmax(0,fmin(hwm_max_offset(),view->strip_offset+hwm_held_lead));
+    }
     double elapsed=now-view->strip_scroll_start;
     double value=hstrip_spring(view->strip_from_offset,view->strip_target_offset,hwm_scroll_initial_velocity,
                               elapsed,hwm_scroll_omega/fmax(.15,hwm_motion_scale),&hwm_scroll_current_velocity);
@@ -273,10 +374,17 @@ static void horizontal_tick(void)
     __atomic_store_n(&hwm_tick_pending, false, __ATOMIC_RELEASE);
     if (hwm_stop_requested) { hwm_shutdown(); return; }
     if (!hwm_ready || hwm_paused || hwm_suspended || mission_control_is_active()) return;
-    if(hwm_overview_active) { hwm_overview_tick(); return; }
-    double start = hwm_now();
+    double start = hwm_now(), latency = hwm_tick_note(start);
+    if(hwm_overview_active) { hwm_drawn_time=start; hwm_overview_tick(); hwm_tick_previous_active=hwm_active; return; }
+    hwm_tick_previous_active=false;
     struct view *view = hwm_view();
-    if (!view || !space_is_visible(view->sid)) return;
+    if (!view || !space_is_visible(view->sid)) {
+        // Nothing can be drawn (a native fullscreen Space is in front). Returning
+        // to the strip wakes the clock again; until then it should not keep ticking.
+        __atomic_store_n(&hwm_active,false,__ATOMIC_RELEASE);
+        return;
+    }
+    hwm_drawn_time=start;
     if (!hwm_backend_ok) {
         if (start-hwm_last_backend_retry < 2) return;
         hwm_last_backend_retry = start;
@@ -289,6 +397,10 @@ static void horizontal_tick(void)
         __atomic_store_n(&__pending_gesture,false,__ATOMIC_RELEASE);
         hwm_focus_after_scroll = true;
     }
+    // Where the fingers are as this frame is drawn; see hwm_held_velocity.
+    hwm_held_lead=0;
+    if(__atomic_load_n(&__pending_gesture,__ATOMIC_RELAXED) && !hwm_rubber && hwm_motion_scale>0)
+        hwm_held_lead=hwm_held_lead_at(latency<8 ? start-latency/1000 : start,view->strip_offset);
     // Applied once the keys or fingers rest; a swipe still in progress may yet go further.
     if(hwm_nav_pending && start-hwm_nav_time>.07 && !__atomic_load_n(&__pending_gesture,__ATOMIC_RELAXED)) hwm_nav_flush();
     // A wheel pan that has been quiet for 90 ms is taken as "this is where I want to be".
@@ -350,6 +462,9 @@ static void horizontal_tick(void)
     ++hwm_frames;
     if (elapsed > 8.34) ++hwm_slow_frames;
     if (elapsed > hwm_max_frame_ms) hwm_max_frame_ms = elapsed;
+    hwm_frame_log[hwm_frame_log_count%HWM_FRAME_LOG].time=start; hwm_frame_log[hwm_frame_log_count%HWM_FRAME_LOG].offset=hwm_rendered_offset;
+    hwm_frame_log[hwm_frame_log_count%HWM_FRAME_LOG].tick_ms=elapsed; hwm_frame_log[hwm_frame_log_count++%HWM_FRAME_LOG].latency_ms=latency;
+    hwm_tick_previous_active=active;
     __atomic_store_n(&hwm_active, active || !hwm_backend_ok, __ATOMIC_RELEASE);
 }
 
@@ -360,6 +475,7 @@ static CVReturn hwm_display_tick(CVDisplayLinkRef link, const CVTimeStamp *now, 
     bool expected = false;
     if ((__atomic_load_n(&hwm_active, __ATOMIC_ACQUIRE) || hwm_stop_requested) &&
         __atomic_compare_exchange_n(&hwm_tick_pending, &expected, true, false, __ATOMIC_ACQ_REL, __ATOMIC_RELAXED)) {
+        __atomic_store_n(&hwm_tick_posted, read_os_timer(), __ATOMIC_RELAXED);
         event_loop_post(&g_event_loop, HORIZONTAL_TICK, NULL, 0);
     }
     return kCVReturnSuccess;
@@ -709,6 +825,18 @@ static void hwm_action(int action)
     }
 }
 
+/* The action bound to a key press, if any. */
+static NSString *hwm_shortcut_action(CGEventRef event,int code)
+{
+    CGEventFlags flags=CGEventGetFlags(event);
+    TanaConfigSnapshot *snapshot=[hwm_config copySnapshot];
+    NSString *name=[snapshot actionForKeyCode:(unsigned short)code modifiers:(NSUInteger)flags];
+    // macOS tags physical arrow keys with Function even without an Fn chord.
+    if(!name && code>=123 && code<=126) name=[snapshot actionForKeyCode:(unsigned short)code modifiers:((NSUInteger)flags&~NSEventModifierFlagFunction)];
+    name=[[name retain] autorelease];
+    [snapshot release];
+    return name;
+}
 static bool horizontal_event(CGEventType type, CGEventRef event)
 {
     if (!hwm_ready) return false;
@@ -753,6 +881,12 @@ static bool horizontal_event(CGEventType type, CGEventRef event)
     if(hwm_overview_active && type==kCGEventKeyDown) {
         int code=(int)CGEventGetIntegerValueField(event,kCGKeyboardEventKeycode);
         if(code>=0 && code<128) hwm_keys[code]=true;
+        // The shortcuts that open the overview also close it; every other key belongs to the overview itself.
+        NSString *bound=hwm_shortcut_action(event,code);
+        if([bound hasPrefix:@"overview"]) {
+            if(!CGEventGetIntegerValueField(event,kCGKeyboardEventAutorepeat)) event_loop_post(&g_event_loop,HORIZONTAL_INPUT,strdup(bound.UTF8String),HWM_NAMED_ACTION);
+            return true;
+        }
         event_loop_post(&g_event_loop,HORIZONTAL_INPUT,(void *)CFRetain(event),HWM_OVERVIEW_KEY);
         return true;
     }
@@ -765,18 +899,16 @@ static bool horizontal_event(CGEventType type, CGEventRef event)
             event_loop_post(&g_event_loop,HORIZONTAL_INPUT,NULL,HWM_CANCEL_DRAG); return true;
         }
         (void)modifiers;
-        TanaConfigSnapshot *snapshot=[hwm_config copySnapshot];
-        NSString *name=[snapshot actionForKeyCode:(unsigned short)code modifiers:(NSUInteger)flags];
-        // macOS tags physical arrow keys with Function even without an Fn chord.
-        if(!name && code>=123 && code<=126) name=[snapshot actionForKeyCode:(unsigned short)code modifiers:((NSUInteger)flags&~NSEventModifierFlagFunction)];
+        NSString *name=hwm_shortcut_action(event,code);
+        // With no overview to close, the key keeps its usual meaning.
+        if([name isEqualToString:@"overview-close"]) name=nil;
         if(name) {
             bool repeat=CGEventGetIntegerValueField(event,kCGKeyboardEventAutorepeat);
             bool allow=[@[@"left",@"right",@"up",@"down",@"move-left",@"move-right",@"swap-left",@"swap-right"] containsObject:name];
             if(!repeat || allow) event_loop_post(&g_event_loop,HORIZONTAL_INPUT,strdup(name.UTF8String),HWM_NAMED_ACTION);
             ++hwm_key_actions; if(code>=0 && code<128) hwm_keys[code]=true;
-            [snapshot release]; return true;
+            return true;
         }
-        [snapshot release];
     }
     if (type == kCGEventScrollWheel && (CGEventGetFlags(event)&kCGEventFlagMaskAlternate)) {
         if (CGEventGetFlags(event)&(kCGEventFlagMaskCommand|kCGEventFlagMaskControl)) return false;
@@ -931,6 +1063,9 @@ static void horizontal_input(void *context, int action)
         double progress = CGEventGetDoubleValueField(event,124);
         if (!isfinite(progress) || fabs(progress) > 20) { CFRelease(event); return; }
         double width = hwm_bounds(view).size.width;
+        // Speeds are measured between the reports themselves; the time each one
+        // spent queued behind other work would otherwise read as a change of speed.
+        double stamp = hwm_event_time(event,now);
         progress*=hwm_swipe_gain;
         if (phase == 1) {
             hwm_snap_origin = view->strip_target_offset;
@@ -938,11 +1073,12 @@ static void horizontal_input(void *context, int action)
             view->strip_scrolling = false;
             view->strip_velocity = 0;
             view->strip_last_progress = progress;
-            view->strip_last_time = now;
+            view->strip_last_time = stamp;
+            hwm_held_velocity=0; hwm_held_lead=0; hwm_held_time=stamp; hwm_held_count=0;
             hwm_wake();
             __atomic_store_n(&__pending_gesture,true,__ATOMIC_RELEASE);
         } else if (phase == 2) {
-            double dt = now-view->strip_last_time;
+            double dt = stamp-view->strip_last_time;
             if (dt > .001 && dt < .15) {
                 double velocity = (progress-view->strip_last_progress)*width/dt;
                 view->strip_velocity = view->strip_velocity*.65+velocity*.35;
@@ -951,15 +1087,21 @@ static void horizontal_input(void *context, int action)
             hwm_scroll(view,raw<0 || raw>limit ? raw : hwm_magnetize(view,raw,width),false);
             // Past either end the strip keeps following the finger, with growing resistance.
             hwm_rubber=hwm_motion_scale==0 ? 0 : raw<0 ? -hstrip_rubber_band(-raw,width*.3) : raw>limit ? hstrip_rubber_band(raw-limit,width*.3) : 0;
+            // A pause or an end of the strip starts the measurement afresh.
+            if(hwm_rubber || stamp-hwm_held_time>.1) { hwm_held_count=0; hwm_held_lead=0; }
+            if(!hwm_rubber) hwm_held_note(stamp,view->strip_offset);
+            hwm_held_time=stamp;
             view->strip_last_progress = progress;
-            view->strip_last_time = now;
+            view->strip_last_time = stamp;
+            hwm_input_log[hwm_input_log_count%HWM_FRAME_LOG].time=stamp; hwm_input_log[hwm_input_log_count++%HWM_FRAME_LOG].offset=raw;
         } else if (phase == 4 || phase == 8) {
-            double velocity = now-view->strip_last_time < .1 && !hwm_rubber ? view->strip_velocity : 0;
+            double velocity = stamp-view->strip_last_time < .1 && !hwm_rubber ? view->strip_velocity : 0;
             double coast = phase == 8 ? 0 : fmax(-width*.65,fmin(width*.65,velocity/hwm_scroll_omega));
             double target=view->strip_offset+coast;
             if(phase==4) target=hwm_snap_target(view,target,width,true);
             hwm_scroll_current_velocity=phase==8?0:velocity; hwm_release_velocity=true;
-            hwm_scroll(view,target,true);
+            hwm_scroll(view,target,true); // Starts from where the last frame drew the strip.
+            hwm_held_velocity=0; hwm_held_lead=0; hwm_held_count=0;
             // Focus goes where the strip is going, decided now rather than when it arrives.
             if(phase==4) hwm_focus_follow_to(view,view->strip_target_offset);
             hwm_focus_after_scroll = true;
@@ -1267,6 +1409,34 @@ static void horizontal_command(FILE *rsp, char *message)
         if(token_equals(command,"profile-reset")) { memset(hwm_prof,0,sizeof(hwm_prof)); hwm_prof_drag_ticks=0; hwm_prof_drag_events=0; hwm_feedback_shows=0; hwm_feedback_show_max_ms=0; hwm_ax_resizes_sent=0; hwm_ax_resizes_coalesced=0; hwm_ax_resize_max_ms=0; hwm_max_frame_ms=0; hwm_slow_frames=0; hwm_frames=0; }
         return;
     }
+    if(token_equals(command,"pacing") || token_equals(command,"pacing-reset")) {
+        fprintf(rsp,"{\"frames\":%llu,\"frames_over_8ms\":%llu,\"max_frame_ms\":%.3f,\"tick_latency_avg_ms\":%.3f,\"tick_latency_max_ms\":%.3f,\"ticks_late_over_4ms\":%llu,\"frames_dropped\":%llu,\"frame_gap_max_ms\":%.3f,\"stalls_over_2ms\":%llu,\"stall_max_ms\":%.3f,\"stall_event\":\"%s\",\"events\":{",
+                (unsigned long long)hwm_frames,(unsigned long long)hwm_slow_frames,hwm_max_frame_ms,hwm_event_prof[HORIZONTAL_TICK].count?hwm_tick_latency_total_ms/(double)hwm_event_prof[HORIZONTAL_TICK].count:0,hwm_tick_latency_max_ms,
+                (unsigned long long)hwm_tick_late,(unsigned long long)hwm_frames_dropped,hwm_frame_gap_max_ms,(unsigned long long)hwm_stalls,hwm_stall_max_ms,hwm_stall_type>=0?hwm_event_names[hwm_stall_type]:"");
+        bool first=true;
+        for(int i=0;i<(int)(sizeof(hwm_event_names)/sizeof(*hwm_event_names)) && i<64;i++) if(hwm_event_prof[i].count) {
+            fprintf(rsp,"%s\"%s\":{\"count\":%llu,\"avg_ms\":%.3f,\"max_ms\":%.3f}",first?"":",",hwm_event_names[i],(unsigned long long)hwm_event_prof[i].count,hwm_event_prof[i].total_ms/(double)hwm_event_prof[i].count,hwm_event_prof[i].max_ms);
+            first=false;
+        }
+        fprintf(rsp,"}}\n");
+        if(token_equals(command,"pacing-reset")) {
+            memset(hwm_event_prof,0,sizeof(hwm_event_prof)); hwm_tick_late=0; hwm_frames_dropped=0; hwm_stalls=0; hwm_stall_type=-1;
+            hwm_tick_latency_max_ms=0; hwm_tick_latency_total_ms=0; hwm_frame_gap_max_ms=0; hwm_stall_max_ms=0;
+            hwm_frames=0; hwm_slow_frames=0; hwm_max_frame_ms=0; hwm_frame_log_count=0; hwm_input_log_count=0;
+        }
+        return;
+    }
+    if(token_equals(command,"frame-log")) {
+        // The most recent frames and held-swipe samples, oldest first.
+        uint64_t frames=hwm_frame_log_count<HWM_FRAME_LOG?hwm_frame_log_count:HWM_FRAME_LOG, inputs=hwm_input_log_count<HWM_FRAME_LOG?hwm_input_log_count:HWM_FRAME_LOG;
+        fprintf(rsp,"{\"frames\":[");
+        for(uint64_t i=0;i<frames;i++) { uint64_t k=(hwm_frame_log_count-frames+i)%HWM_FRAME_LOG;
+            fprintf(rsp,"%s[%.5f,%.2f,%.3f,%.3f]",i?",":"",hwm_frame_log[k].time,hwm_frame_log[k].offset,hwm_frame_log[k].tick_ms,hwm_frame_log[k].latency_ms); }
+        fprintf(rsp,"],\"inputs\":[");
+        for(uint64_t i=0;i<inputs;i++) { uint64_t k=(hwm_input_log_count-inputs+i)%HWM_FRAME_LOG;
+            fprintf(rsp,"%s[%.5f,%.2f]",i?",":"",hwm_input_log[k].time,hwm_input_log[k].offset); }
+        fprintf(rsp,"]}\n"); return;
+    }
     if(token_equals(command,"overview")) { hwm_action(HWM_OVERVIEW); return; }
     if(token_equals(command,"overview-cancel")) { hwm_action(HWM_OVERVIEW_CANCEL); return; }
     if(token_equals(command,"overview-progress")) {
@@ -1281,7 +1451,7 @@ static void horizontal_command(FILE *rsp, char *message)
     struct view *view = hwm_view();
     if (token_equals(command,"input-status")) {
         CFMachPortRef tap=__atomic_load_n(&g_mouse_state.handle,__ATOMIC_RELAXED);
-        fprintf(rsp,"{\"tap_enabled\":%s,\"key_actions\":%llu,\"suspended\":%s,\"overview\":%s,\"overview_renderer\":\"native\",\"overview_windows\":%u,\"overview_frames\":%llu,\"overview_frames_over_8ms\":%llu,\"overview_max_frame_ms\":%.3f,\"vertical_progress\":%.4f,\"overview_closing\":%s,\"overview_animating\":%s,\"overview_gesture_active\":%s,\"mission_control\":%s}\n",tap&&CGEventTapIsEnabled(tap)?"true":"false",(unsigned long long)hwm_key_actions,hwm_suspended?"true":"false",hwm_overview_active?"true":"false",(unsigned)hwm_overview_window_count,(unsigned long long)hwm_overview_frames,(unsigned long long)hwm_overview_slow_frames,hwm_overview_max_frame_ms,hwm_vertical_last_progress,hwm_overview_closing?"true":"false",hwm_overview_animating?"true":"false",hwm_overview_gesture_active?"true":"false",mission_control_is_active()?"true":"false"); return;
+        fprintf(rsp,"{\"tap_enabled\":%s,\"key_actions\":%llu,\"suspended\":%s,\"overview\":%s,\"overview_renderer\":\"native\",\"overview_windows\":%u,\"overview_frames\":%llu,\"overview_frames_over_8ms\":%llu,\"overview_max_frame_ms\":%.3f,\"overview_queue_max_ms\":%.3f,\"overview_flush_max_ms\":%.3f,\"overview_present_max_ms\":%.3f,\"overview_begin_ms\":%.3f,\"vertical_progress\":%.4f,\"overview_closing\":%s,\"overview_animating\":%s,\"overview_gesture_active\":%s,\"mission_control\":%s}\n",tap&&CGEventTapIsEnabled(tap)?"true":"false",(unsigned long long)hwm_key_actions,hwm_suspended?"true":"false",hwm_overview_active?"true":"false",(unsigned)hwm_overview_window_count,(unsigned long long)hwm_overview_frames,(unsigned long long)hwm_overview_slow_frames,hwm_overview_max_frame_ms,hwm_overview_queue_max_ms,hwm_overview_flush_max_ms,hwm_overview_present_max_ms,hwm_overview_begin_ms,hwm_vertical_last_progress,hwm_overview_closing?"true":"false",hwm_overview_animating?"true":"false",hwm_overview_gesture_active?"true":"false",mission_control_is_active()?"true":"false"); return;
     }
     if (token_equals(command,"status")) {
         fprintf(rsp,"{\"version\":\"0.2.0\",\"ready\":%s,\"paused\":%s,\"backend\":%s,\"space\":%llu,\"offset\":%.3f,\"autofocus\":%s,\"frames\":%llu,\"frames_over_8ms\":%llu,\"max_frame_ms\":%.3f,\"move_failures\":%llu,\"resize_operations\":%llu,\"windows\":[",hwm_ready?"true":"false",hwm_paused?"true":"false",hwm_backend_ok?"true":"false",(unsigned long long)hwm_space,view?view->strip_offset:0,g_window_manager.ffm_mode==FFM_AUTOFOCUS?"true":"false",(unsigned long long)hwm_frames,(unsigned long long)hwm_slow_frames,hwm_max_frame_ms,(unsigned long long)hwm_move_failures,(unsigned long long)hwm_resize_operations);
@@ -1457,7 +1627,7 @@ static long long hwm_boot_time(void)
     sysctlbyname("kern.boottime",&boot,&length,NULL,0);
     return boot.tv_sec;
 }
-static void hwm_save_state(void)
+static void hwm_save_state_now(bool wait)
 {
     struct view *view = hwm_view(); if (!view || hwm_resume_load_state) return;
     NSMutableArray *order = [NSMutableArray array];
@@ -1470,14 +1640,23 @@ static void hwm_save_state(void)
     })
     NSDictionary *state=@{@"version":@1,@"boot":@(hwm_boot_time()),@"offset":@(view->strip_target_offset),@"order":order,@"windows":windows,@"workflow":hwm_workflow_save()};
     NSString *path=hwm_state_path();
-    NSError *error=nil;
-    [[NSFileManager defaultManager] createDirectoryAtPath:path.stringByDeletingLastPathComponent withIntermediateDirectories:YES attributes:@{NSFilePosixPermissions:@0700} error:&error];
-    NSData *data=[NSJSONSerialization dataWithJSONObject:state options:0 error:&error];
-    if (data && [data writeToFile:path options:NSDataWritingAtomic error:&error]) {
-        [[NSFileManager defaultManager] setAttributes:@{NSFilePosixPermissions:@0600} ofItemAtPath:path error:nil];
-        hwm_state_pending=false;
-    } else warn("Tana: layout could not be saved: %s\n",error.localizedDescription.UTF8String);
+    NSData *data=[NSJSONSerialization dataWithJSONObject:state options:0 error:NULL];
+    if(!data) { warn("Tana: layout could not be saved.\n"); return; }
+    hwm_state_pending=false;
+    // The snapshot is taken here; the disk is touched on its own queue, in
+    // order, so a save after every settled animation never costs a frame.
+    static dispatch_queue_t queue; static dispatch_once_t once;
+    dispatch_once(&once,^{ queue=dispatch_queue_create("tana.state",dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL,QOS_CLASS_UTILITY,0)); });
+    void (^write)(void)=^{
+        NSError *error=nil;
+        [[NSFileManager defaultManager] createDirectoryAtPath:path.stringByDeletingLastPathComponent withIntermediateDirectories:YES attributes:@{NSFilePosixPermissions:@0700} error:&error];
+        if ([data writeToFile:path options:NSDataWritingAtomic error:&error])
+            [[NSFileManager defaultManager] setAttributes:@{NSFilePosixPermissions:@0600} ofItemAtPath:path error:nil];
+        else warn("Tana: layout could not be saved: %s\n",error.localizedDescription.UTF8String);
+    };
+    if(wait) dispatch_sync(queue,write); else dispatch_async(queue,write);
 }
+static void hwm_save_state(void) { hwm_save_state_now(false); }
 static void hwm_load_state(void)
 {
     NSData *data=[NSData dataWithContentsOfFile:hwm_state_path()];
@@ -1553,7 +1732,7 @@ static void hwm_shutdown(void)
     hwm_cancel_closing();
     hwm_cancel_pops();
     hwm_alpha_sync(true);
-    hwm_save_state();
+    hwm_save_state_now(true); // On disk before the process goes away.
     hwm_ready = false;
     __atomic_store_n(&hwm_active,false,__ATOMIC_RELEASE);
     if(hwm_display_link) CVDisplayLinkStop(hwm_display_link);
@@ -1612,7 +1791,14 @@ static void horizontal_begin(void)
     hwm_external_borders_refresh();
     hwm_alpha_focus=hwm_feedback_focus_id=g_window_manager.focused_window_id;
     hwm_alpha_sync(false);
-    dispatch_async(dispatch_get_main_queue(), ^{ hwm_menu_begin(); });
+    dispatch_async(dispatch_get_main_queue(), ^{
+        // An agent with no windows of its own is a candidate for App Nap,
+        // which throttles exactly the timers and threads that draw frames.
+        static id activity;
+        if(!activity) activity=[[[NSProcessInfo processInfo] beginActivityWithOptions:NSActivityUserInitiatedAllowingIdleSystemSleep reason:@"Window management must respond to input without delay"] retain];
+        hwm_menu_begin();
+        [[HorizontalWindowOverview sharedOverview] prepareForScreenFrame:CGDisplayBounds(CGMainDisplayID())];
+    });
 }
 
 static void horizontal_resume(void)
@@ -1646,15 +1832,22 @@ static void hwm_start_clock(void)
 {
     if(!hwm_fallback_timer) {
         hwm_fallback_timer=dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER,0,0,dispatch_get_main_queue());
-        dispatch_source_set_timer(hwm_fallback_timer,dispatch_time(DISPATCH_TIME_NOW,0),NSEC_PER_SEC/60,NSEC_PER_MSEC);
-        __block double last_reconcile=0;
+        dispatch_source_set_timer(hwm_fallback_timer,dispatch_time(DISPATCH_TIME_NOW,0),NSEC_PER_SEC/10,10*NSEC_PER_MSEC);
+        __block double last_reconcile=0; __block bool fast=false;
         dispatch_source_set_event_handler(hwm_fallback_timer,^{
             double now=hwm_now(); bool expected=false;
-            if(now-last_reconcile>.1 && __atomic_compare_exchange_n(&hwm_reconcile_pending,&expected,true,false,__ATOMIC_ACQ_REL,__ATOMIC_RELAXED)) {
+            if(now-last_reconcile>.095 && __atomic_compare_exchange_n(&hwm_reconcile_pending,&expected,true,false,__ATOMIC_ACQ_REL,__ATOMIC_RELAXED)) {
                 last_reconcile=now; event_loop_post(&g_event_loop,HORIZONTAL_RECONCILE,NULL,0);
             }
-            if(hwm_stop_requested || !hwm_display_link || !CVDisplayLinkIsRunning(hwm_display_link))
-                hwm_display_tick(NULL,NULL,NULL,0,NULL,NULL);
+            // With the display clock running this timer only paces the
+            // housekeeping sweep. It becomes the frame clock, at frame rate,
+            // only for as long as the display clock is not running.
+            bool stand_in=hwm_stop_requested || !hwm_display_link || !CVDisplayLinkIsRunning(hwm_display_link);
+            if(stand_in!=fast) {
+                fast=stand_in;
+                dispatch_source_set_timer(hwm_fallback_timer,dispatch_time(DISPATCH_TIME_NOW,0),fast?NSEC_PER_SEC/60:NSEC_PER_SEC/10,(fast?1:10)*NSEC_PER_MSEC);
+            }
+            if(stand_in) hwm_display_tick(NULL,NULL,NULL,0,NULL,NULL);
         });
         dispatch_resume(hwm_fallback_timer);
     }
@@ -1694,6 +1887,15 @@ static void horizontal_reconcile(void)
     if(hwm_ready && !hwm_suspended) hwm_config_poll();
     if(!hwm_ready || hwm_suspended || hwm_paused || hwm_overview_active || mission_control_is_active()) return;
     double now=hwm_now();
+    // This sweep asks WindowServer about every window. It waits while frames
+    // are being drawn: the round trips come out of the same thread's time, and
+    // WindowServer reports ordering changes as they happen in any case.
+    if(now-hwm_drawn_time<.2) return;
+    // Promptly for a second after anything moved, which is when a correction
+    // can be needed; twice a second while the desktop is at rest.
+    static double last_sweep;
+    if(now-hwm_drawn_time>1 && now-last_sweep<.5) return;
+    last_sweep=now;
     // Retained Cocoa windows can close without an AX destruction notification.
     // WindowServer ordering catches that case without polling Accessibility.
     table_for(struct window *w,g_window_manager.window, {
@@ -1725,8 +1927,23 @@ static void horizontal_reconcile(void)
     })
 }
 
+/* Tana named the window when it asked for an activation, so the report that
+ * the application came forward need not ask the application which window it
+ * focused. That question is a blocking Accessibility round trip to an
+ * application busy activating, on the thread drawing the settle animation.
+ * The application's own focus notification still follows and corrects this
+ * should it have chosen otherwise. */
+static uint32_t hwm_requested_focus; static double hwm_requested_focus_time;
+static uint32_t horizontal_expected_focus(struct application *application)
+{
+    if(!hwm_ready || !hwm_requested_focus || hwm_now()-hwm_requested_focus_time>.5) return 0;
+    struct window *window=window_manager_find_window(&g_window_manager,hwm_requested_focus);
+    return window && window->application==application && !window_check_flag(window,WINDOW_MINIMIZE) ? window->id : 0;
+}
+
 static void horizontal_focus_requested(uint32_t wid)
 {
+    hwm_requested_focus=wid; hwm_requested_focus_time=hwm_now();
     struct window *window=window_manager_find_window(&g_window_manager,wid);
     if(window) horizontal_focused(window,window_manager_find_managed_window(&g_window_manager,window));
 }

@@ -6,7 +6,10 @@ static NSDictionary *hwm_default_shortcuts(void)
       @"center":@"alt+cmd+c",@"home":@"alt+cmd+0",@"close":@"cmd+q",@"terminal":@"cmd+return",@"terminal-keypad":@"cmd+keycode:76",@"browser":@"shift+cmd+w",
       @"preset-width":@"alt+cmd+r",@"fit-two":@"alt+cmd+=",@"previous":@"alt+cmd+tab",@"undo":@"alt+cmd+z",
       @"consume":@"alt+cmd+]",@"expel":@"alt+cmd+[",@"up":@"alt+cmd+up",@"down":@"alt+cmd+down",
-      @"utility-mark":@"ctrl+alt+shift+space",@"utility":@"ctrl+alt+space",@"tabs":@"alt+cmd+t",@"overview":@"alt+cmd+o",@"commands":@"ctrl+alt+p"};
+      @"utility-mark":@"ctrl+alt+shift+space",@"utility":@"ctrl+alt+space",@"tabs":@"alt+cmd+t",@"overview":@"alt+cmd+o",
+      // The Mission Control keys show Tana's overview: Mission Control itself lays every window of the
+      // strip out as if it were on screen, which is no picture of the strip at all.
+      @"overview-mission":@"ctrl+up",@"overview-close":@"ctrl+down",@"commands":@"ctrl+alt+p"};
 }
 static NSArray *hwm_width_presets(void)
 {
@@ -228,8 +231,8 @@ static bool hwm_named_action(const char *name)
         }); return true;
     }
     if(strcmp(name,"remember-width")==0 || strcmp(name,"remember-floating")==0 || strcmp(name,"remember-beside")==0) { hwm_remember_app(name); hwm_hud(@"App preference saved"); return true; }
-    const char *names[]={"left","right","move-left","move-right","swap-left","swap-right","move-first","move-last","float","full","center","home","pause","reflow","close","terminal","browser","overview","float-alt","full-alt","terminal-keypad","full-keypad"};
-    int actions[]={HWM_LEFT,HWM_RIGHT,HWM_MOVE_LEFT,HWM_MOVE_RIGHT,HWM_MOVE_LEFT,HWM_MOVE_RIGHT,HWM_MOVE_FIRST,HWM_MOVE_LAST,HWM_FLOAT,HWM_FULL,HWM_CENTER,HWM_HOME,HWM_PAUSE,HWM_REFLOW,HWM_CLOSE,HWM_TERMINAL,HWM_BROWSER,HWM_OVERVIEW,HWM_FLOAT,HWM_FULL,HWM_TERMINAL,HWM_FULL};
+    const char *names[]={"left","right","move-left","move-right","swap-left","swap-right","move-first","move-last","float","full","center","home","pause","reflow","close","terminal","browser","overview","float-alt","full-alt","terminal-keypad","full-keypad","overview-mission","overview-close"};
+    int actions[]={HWM_LEFT,HWM_RIGHT,HWM_MOVE_LEFT,HWM_MOVE_RIGHT,HWM_MOVE_LEFT,HWM_MOVE_RIGHT,HWM_MOVE_FIRST,HWM_MOVE_LAST,HWM_FLOAT,HWM_FULL,HWM_CENTER,HWM_HOME,HWM_PAUSE,HWM_REFLOW,HWM_CLOSE,HWM_TERMINAL,HWM_BROWSER,HWM_OVERVIEW,HWM_FLOAT,HWM_FULL,HWM_TERMINAL,HWM_FULL,HWM_OVERVIEW,HWM_OVERVIEW_CANCEL};
     for(size_t i=0;i<sizeof(actions)/sizeof(*actions);i++) if(strcmp(name,names[i])==0) {
         if(actions[i]==HWM_FLOAT || actions[i]==HWM_FULL) hwm_undo_capture();
         hwm_action(actions[i]); return true;

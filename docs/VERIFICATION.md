@@ -112,3 +112,12 @@ Existing macOS Spaces are retained as recovery targets; the interface pins one a
 - Extended `tests/gesture_probe.m` with vertical streams and individual phases. Build it with `xcrun clang -Wall -Wextra -Werror tests/gesture_probe.m -framework Cocoa -o build/gesture_probe`, then run `python3 tests/live_overview_gesture_check.py` with Tana active and the pointer idle.
 - The live gesture regression passed: a new begin during close, five up/down cycles, reversal during opening, missing terminal events in both directions, cancellation in both directions, restoration of actual window geometry/transforms, and subsequent horizontal input moving actual windows. The original viewport was restored. Evidence: `build/overview-gesture-check.json`.
 - The existing native overview/border restoration check also passed with seven windows and eight border windows. Physical trackpad reproduction remains a user acceptance check; injected native events do not establish physical trackpad behavior.
+
+## Frame pacing, overview captions and Mission Control keys (2026-10-12)
+
+- `make test` passes, including new transport tests: pipelined messages are applied in order across the queue limit, a batch shares one deadline, an unanswered or unsendable message fails its batch and not the next, and no descriptor leaks.
+- `tests/live_overview_gesture_check.py` passes on the running build (begin during close, five cycles, reversal, missing terminal events, cancellation, subsequent horizontal input).
+- Pacing figures are in [PERFORMANCE.md](PERFORMANCE.md). They come from synthetic swipes; a physical three-finger swipe was not observed by the author of the change.
+- Control + Up opened Tana's overview and Control + Up or Control + Down closed it, with `mission_control` false throughout, using synthetic key events. Option + Command + O now also closes an open overview; before, the overview swallowed it. A physical keyboard was not used.
+- A screenshot of the open overview showed a caption pill on all eight cards and no screen-sharing pill detached from the Chrome card that had one. The scrim window's opacity was sampled every 30 ms through an open (0.23, 0.37, 0.50, 0.60, 0.73, 0.87, 1.00) and a close (0.86 down to 0.00): it fades, it does not jump.
+- Not observed: how the pills look while cards are dragged to rearrange, and the Mission Control key on an Apple keyboard, which is not bound (it is not an ordinary key code).

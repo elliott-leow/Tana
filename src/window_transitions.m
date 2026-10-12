@@ -20,6 +20,7 @@ static void hwm_scale_center(uint32_t wid,bool *scaled,double scale)
     bool apply=scale<.999;
     if(!*scaled && !apply) return;
     CGRect b=CGRectNull;
+    hwm_batch_settle();
     if(SLSGetWindowBounds(g_connection,wid,&b)!=kCGErrorSuccess || CGRectIsNull(b) || b.size.width<=0 || b.size.height<=0) { *scaled=false; return; }
     // Reset and rescale belong to one compositor update: no full-size frame between them.
     hwm_batch_begin();

@@ -93,6 +93,7 @@ struct window
     CFStringRef role;
     CFStringRef subrole;
     CFStringRef title;
+    bool title_stale; /* the application reported a new title that has not been fetched yet */
     CGRect frame;
     CGRect windowed_frame;
     bool is_root;

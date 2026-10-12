@@ -83,6 +83,10 @@ static void SLSGetCurrentCursorLocation(int connection,CGPoint *point) { (void)c
 static void SLSDisableUpdate(int connection) { (void)connection; assert(update_depth==0); ++update_depth; ++disable_calls; }
 static void SLSReenableUpdate(int connection) { (void)connection; assert(update_depth==1); --update_depth; }
 static bool scripting_addition_set_layer(uint32_t id,int layer) { (void)id; (void)layer; return true; }
+static int sa_batch_depth, sa_batch_flushes;
+static void scripting_addition_batch_begin(void) { ++sa_batch_depth; }
+static bool scripting_addition_batch_flush(void) { ++sa_batch_flushes; return true; }
+static bool scripting_addition_batch_end(void) { assert(sa_batch_depth>0); --sa_batch_depth; return true; }
 static bool scripting_addition_move_window(uint32_t id,double x,double y) { ++moves; if(move_fails) return false; actual[id-1].origin=CGPointMake(x,y); return true; }
 static void window_manager_set_window_frame(struct window *w,double x,double y,double width,double height) { ++ax_calls; actual[w->id-1]=CGRectMake(x,y,width,height); }
 static void window_manager_resize_window(struct window *w,double width,double height) { ++ax_calls; actual[w->id-1].size=CGSizeMake(width,height); }

@@ -45,7 +45,8 @@ static void window_did_receive_focus(struct window_manager *wm, struct mouse_sta
 {
     struct window *focused_window = window_manager_find_window(wm, wm->focused_window_id);
     horizontal_focus_transition(focused_window,window);
-    if (focused_window && focused_window != window && window_space(focused_window->id) == window_space(window->id)) {
+    // The opacity setting is checked first: the two Space lookups are WindowServer round trips.
+    if (wm->enable_window_opacity && focused_window && focused_window != window && window_space(focused_window->id) == window_space(window->id)) {
         window_manager_set_window_opacity(wm, focused_window, g_window_manager.normal_window_opacity);
     }
 
@@ -412,7 +413,8 @@ static EVENT_HANDLER(APPLICATION_FRONT_SWITCHED)
         }
     }
 
-    uint32_t application_focused_window_id = application_focused_window(application);
+    uint32_t application_focused_window_id = horizontal_expected_focus(application);
+    if (!application_focused_window_id) application_focused_window_id = application_focused_window(application);
     if (!application_focused_window_id) {
         struct window *focused_window = window_manager_find_window(&g_window_manager, g_window_manager.focused_window_id);
         if (focused_window) {
@@ -967,9 +969,10 @@ static EVENT_HANDLER(WINDOW_TITLE_CHANGED)
 
     debug("%s: %s %d\n", __FUNCTION__, window->application->name, window->id);
 
-    if (window->title) CFRelease(window->title);
-
-    window->title = window_title(window);
+    // Fetching a title is a blocking round trip to the application, and
+    // terminals and browsers retitle constantly. It is fetched when something
+    // next asks for it (a signal, a rule, a query) rather than on every change.
+    window->title_stale = true;
 
     event_signal_push(SIGNAL_WINDOW_TITLE_CHANGED, window);
 }
@@ -1705,11 +1708,14 @@ static void *event_loop_run(void *context)
                 if (!next) goto empty;
             } while (!__sync_bool_compare_and_swap(&event_loop->head, head, next));
 
-            switch (__atomic_load_n(&next->type, __ATOMIC_RELAXED)) {
+            int type = __atomic_load_n(&next->type, __ATOMIC_RELAXED);
+            uint64_t began = read_os_timer();
+            switch (type) {
 #define EVENT_TYPE_ENTRY(value) case value: EVENT_HANDLER_##value(__atomic_load_n(&next->context, __ATOMIC_RELAXED), __atomic_load_n(&next->param1, __ATOMIC_RELAXED)); break;
                 EVENT_TYPE_LIST
 #undef EVENT_TYPE_ENTRY
             }
+            horizontal_event_timed(type, (double)(read_os_timer()-began)*1000.0/(double)read_os_freq());
 
             event_signal_flush();
             ts_reset();
@@ -1759,7 +1765,13 @@ bool event_loop_begin(struct event_loop *event_loop)
     event_loop->tail = event_loop->head;
 
     event_loop->is_running = true;
-    pthread_create(&event_loop->thread, NULL, &event_loop_run, event_loop);
+    // This thread draws every animation frame. At the default priority it is
+    // preempted by ordinary background work, which shows up as dropped frames.
+    pthread_attr_t attributes;
+    pthread_attr_init(&attributes);
+    pthread_attr_set_qos_class_np(&attributes, QOS_CLASS_USER_INTERACTIVE, 0);
+    pthread_create(&event_loop->thread, &attributes, &event_loop_run, event_loop);
+    pthread_attr_destroy(&attributes);
 
     return true;
 }

@@ -26,6 +26,8 @@ static pid_t hwm_overview_selected_pid;
 static _Atomic bool hwm_overview_ui_pending;
 static uint64_t hwm_overview_frames, hwm_overview_slow_frames;
 static double hwm_overview_max_frame_ms;
+/* Worst time per part of an overview frame, and the cost of opening, in ms. */
+static double hwm_overview_queue_max_ms, hwm_overview_flush_max_ms, hwm_overview_present_max_ms, hwm_overview_begin_ms;
 static NSMutableArray *hwm_overview_borders;
 static double hwm_overview_border_from;
 static double hwm_overview_release_velocity; /* progress per second when the fingers lifted */
@@ -38,17 +40,52 @@ static bool hwm_overview_drag_moved;
 static CGPoint hwm_overview_drag_point, hwm_overview_drag_grab;
 static const double HWMOverviewRegrid=.32, HWMOverviewHover=.14;
 
-static bool hwm_overview_border_owner(uint32_t wid,pid_t pid)
+/* A window id can be reused: only touch one still owned by the process it was recorded for. */
+static bool hwm_overview_owned_by(uint32_t wid,pid_t pid)
 {
     int owner=0; pid_t actual=0;
-    if(SLSGetWindowOwner(g_connection,wid,&owner)!=kCGErrorSuccess ||
-       SLSConnectionGetPID(owner,&actual)!=kCGErrorSuccess || actual!=pid) return false;
+    return SLSGetWindowOwner(g_connection,wid,&owner)==kCGErrorSuccess &&
+           SLSConnectionGetPID(owner,&actual)==kCGErrorSuccess && actual==pid;
+}
+static bool hwm_overview_border_owner(uint32_t wid,pid_t pid)
+{
+    if(!hwm_overview_owned_by(wid,pid)) return false;
     char name[64]={0}; proc_name(pid,name,sizeof(name));
     return strcmp(name,"borders")==0;
+}
+static HWMNativeOverviewWindow *hwm_overview_item(uint32_t wid);
+
+/* Small windows an application attaches to one of its own (the purple
+ * screen-sharing pill in a title bar, for one) are separate windows: they do
+ * not shrink with the card, and would be left hanging in mid-air where the
+ * full-size window used to be. They are hidden while the overview is open. */
+static void hwm_overview_hide_attached(void)
+{
+    for(size_t i=0;i<hwm_overview_count;i++) {
+        HWMNativeOverviewWindow *item=&hwm_overview_windows[i];
+        CFArrayRef attached=SLSCopyAssociatedWindows(g_connection,item->wid);
+        if(!attached) continue;
+        for(CFIndex k=0;k<CFArrayGetCount(attached);k++) {
+            uint32_t wid=0; float alpha=1;
+            CFNumberGetValue(CFArrayGetValueAtIndex(attached,k),kCFNumberSInt32Type,&wid);
+            // Another card is drawn as a card; a window of some other process is not this one's to hide.
+            if(!wid || wid==item->wid || hwm_overview_item(wid) || !hwm_overview_owned_by(wid,item->pid)) continue;
+            if(SLSGetWindowAlpha(g_connection,wid,&alpha)!=kCGErrorSuccess || alpha<=0) continue;
+            [hwm_overview_borders addObject:[NSMutableDictionary dictionaryWithDictionary:
+                @{@"id":@(wid),@"pid":@(item->pid),@"alpha":@(alpha),@"last":@(alpha),@"attached":@YES}]];
+        }
+        CFRelease(attached);
+    }
+}
+
+static bool hwm_overview_fade_window(uint32_t wid,float opacity,float duration)
+{
+    return wid && scripting_addition_set_opacity(wid,opacity,duration);
 }
 
 static void hwm_overview_hide_borders(void)
 {
+    hwm_overview_scrim_fade=hwm_overview_fade_window;
     hwm_overview_borders=[[NSMutableArray alloc] init];
     // Listing every window in the session is slow, and only worth it when an
     // external border tool is actually running.
@@ -78,7 +115,7 @@ static void hwm_overview_restore_borders(void)
 {
     for(NSDictionary *entry in hwm_overview_borders) {
         uint32_t wid=[entry[@"id"] unsignedIntValue];
-        if(hwm_overview_border_owner(wid,[entry[@"pid"] intValue]))
+        if(hwm_overview_owned_by(wid,[entry[@"pid"] intValue]))
             scripting_addition_set_opacity(wid,[entry[@"alpha"] floatValue],0);
     }
     [hwm_overview_borders release]; hwm_overview_borders=nil;
@@ -161,6 +198,8 @@ static void hwm_overview_render(double p)
     // Publish reset+scale for every window as one compositor update. The display
     // never presents the intermediate unscaled frames; no capture cover exists.
     SLSDisableUpdate(g_connection);
+    // Two helper commands per card: handed over together, awaited once.
+    scripting_addition_batch_begin();
     for(size_t i=0;i<hwm_overview_count;i++) {
         HWMNativeOverviewWindow *item=&hwm_overview_windows[i];
         HWMOverviewRect shown=hwm_overview_closing ? hwm_overview_mix(item->close_from,item->destination,p) :
@@ -169,12 +208,20 @@ static void hwm_overview_render(double p)
     }
     double border_visibility=hwm_overview_closing ? hwm_overview_border_from+(1-hwm_overview_border_from)*p : 1-fmin(1,p*4);
     for(NSMutableDictionary *entry in hwm_overview_borders) {
-        float alpha=[entry[@"alpha"] floatValue]*border_visibility;
+        // An attached window is gone almost at once and returns only when its window is back in place.
+        double visibility=[entry[@"attached"] boolValue] ? (hwm_overview_closing ? 0 : 1-fmin(1,p*12)) : border_visibility;
+        float alpha=[entry[@"alpha"] floatValue]*visibility;
         if(fabs(alpha-[entry[@"last"] floatValue])<.001) continue;
         if(scripting_addition_set_opacity([entry[@"id"] unsignedIntValue],alpha,0)) entry[@"last"]=@(alpha);
     }
+    double queued=hwm_now();
+    if(!scripting_addition_batch_end()) ++hwm_move_failures;
+    double flushed=hwm_now();
     SLSReenableUpdate(g_connection);
     double elapsed=(hwm_now()-start)*1000;
+    hwm_overview_queue_max_ms=fmax(hwm_overview_queue_max_ms,(queued-start)*1000);
+    hwm_overview_flush_max_ms=fmax(hwm_overview_flush_max_ms,(flushed-queued)*1000);
+    hwm_overview_present_max_ms=fmax(hwm_overview_present_max_ms,elapsed-(flushed-start)*1000);
     ++hwm_overview_frames;
     if(elapsed>8.34) ++hwm_overview_slow_frames;
     if(elapsed>hwm_overview_max_frame_ms) hwm_overview_max_frame_ms=elapsed;
@@ -207,10 +254,12 @@ static void horizontal_overview_done(void)
 {
     if(!hwm_overview_active) return;
     SLSDisableUpdate(g_connection);
+    scripting_addition_batch_begin();
     for(size_t i=0;i<hwm_overview_count;i++) hwm_overview_reset_transform(&hwm_overview_windows[i]);
     hwm_overview_undim(0);
     hwm_overview_drag_wid=0; hwm_overview_drop_wid=0; hwm_preview_hide();
     hwm_overview_restore_borders();
+    if(!scripting_addition_batch_end()) ++hwm_move_failures;
     SLSReenableUpdate(g_connection);
     ++hwm_overview_generation;
     hwm_overview_closing=false; hwm_overview_animating=false; hwm_overview_gesture_active=false;
@@ -231,14 +280,25 @@ static void horizontal_overview_done(void)
     hwm_hold_focus(); hwm_wake();
 }
 
+/* Progress carried on from the last finger report to now, as for a held
+ * horizontal swipe (see hwm_held_velocity): frames advance evenly however the
+ * reports happen to fall between them. */
+static double hwm_overview_held_progress(double now)
+{
+    double p=hwm_overview_position;
+    if(!hwm_overview_gesture_active || hwm_overview_animating || hwm_overview_closing || hwm_motion_scale==0) return p;
+    double speed=hwm_overview_gesture_velocity*(hwm_overview_gesture_closing?-1:1);
+    return fmax(0,fmin(1,p+speed*fmax(0,fmin(HWMHeldLeadMax,now-hwm_overview_gesture_last_time))));
+}
+
 static void hwm_overview_tick(void)
 {
     if(!hwm_overview_active) return;
     // A cancelled/lost event stream must not leave the input overlay up forever.
     if(hwm_overview_gesture_active && hwm_now()-hwm_overview_gesture_time>.8)
         horizontal_overview_select(0,0);
-    double p=hwm_overview_position, now=hwm_frame_time(hwm_now()), elapsed=now-hwm_overview_animation_start, velocity;
-    bool finished=false;
+    double p=hwm_overview_held_progress(hwm_now()), now=hwm_frame_time(hwm_now()), elapsed=now-hwm_overview_animation_start, velocity;
+    bool finished=false, settling=hwm_overview_animating;
     if(hwm_overview_animating) {
         // The settle continues at the speed the fingers were moving, so a quick
         // flick opens briskly and a slow lift eases in.
@@ -249,7 +309,8 @@ static void hwm_overview_tick(void)
         if(finished) p=1;
     }
     hwm_overview_render(p);
-    if(!hwm_overview_closing) hwm_overview_position=p;
+    // A held gesture's position belongs to the fingers; only a settle writes it back.
+    if(!hwm_overview_closing && settling) hwm_overview_position=p;
     if(hwm_overview_animating && finished) {
         hwm_overview_animating=false;
         if(hwm_overview_closing) { horizontal_overview_done(); return; }
@@ -301,6 +362,7 @@ static void hwm_overview_begin(bool finish)
 {
     if(hwm_overview_active || hwm_paused || hwm_suspended || hwm_drag_window) return;
     struct view *view=hwm_view(); if(!view) return;
+    double began=hwm_now();
     hwm_cancel_closing();
     hwm_feedback_hide();
     hwm_preview_hide();
@@ -323,6 +385,7 @@ static void hwm_overview_begin(bool finish)
     hwm_overview_count=windows.count;
     hwm_overview_window_count=(unsigned)windows.count;
     hwm_overview_frames=0; hwm_overview_slow_frames=0; hwm_overview_max_frame_ms=0;
+    hwm_overview_queue_max_ms=0; hwm_overview_flush_max_ms=0; hwm_overview_present_max_ms=0;
     hwm_hold_focus();
     hwm_overview_original_offset=hwm_offset(view,hwm_now());
     view->strip_scrolling=false; view->strip_target_offset=view->strip_offset;
@@ -351,17 +414,24 @@ static void hwm_overview_begin(bool finish)
             @"grid":[NSValue valueWithRect:NSMakeRect(item->grid.x,item->grid.y,item->grid.width,item->grid.height)]}];
     }
     free(grid);
-    dispatch_sync(dispatch_get_main_queue(), ^{
+    hwm_overview_hide_attached();
+    // Not waited for: the cards start moving on this thread's next frame while
+    // the main thread raises the overlay. Everything sent to the overlay
+    // afterwards goes through the same queue, so it still arrives in order.
+    CGRect screen=hwm_overview_screen; uint64_t generation=hwm_overview_generation;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if(generation!=hwm_overview_generation || !hwm_overview_active) return;
         HorizontalWindowOverview *overview=[HorizontalWindowOverview sharedOverview];
         [overview setHighlightHandler:^(uint32_t wid) { event_loop_post(&g_event_loop,HORIZONTAL_INPUT,(void *)(uintptr_t)wid,HWM_OVERVIEW_HIGHLIGHT); }];
         [overview setFilterHandler:^(NSArray *dimmed) { event_loop_post(&g_event_loop,HORIZONTAL_INPUT,[dimmed copy],HWM_OVERVIEW_FILTER); }];
         [overview setDragHandler:^(uint32_t wid,int phase,NSPoint point) {
             event_loop_post(&g_event_loop,HORIZONTAL_INPUT,[@[@(wid),@(phase),@(point.x),@(point.y)] retain],HWM_OVERVIEW_DRAG);
         }];
-        [[HorizontalWindowOverview sharedOverview] beginWithWindows:entries screenFrame:hwm_overview_screen
+        [overview beginWithWindows:entries screenFrame:screen
             selection:^(uint32_t wid,pid_t pid) { event_loop_post(&g_event_loop,HORIZONTAL_OVERVIEW_SELECT,(void *)(uintptr_t)wid,(int)pid); }
             cancellation:^{ event_loop_post(&g_event_loop,HORIZONTAL_OVERVIEW_SELECT,NULL,0); }];
     });
+    hwm_overview_begin_ms=(hwm_now()-began)*1000;
     if(finish) hwm_overview_finish_opening(); else hwm_wake();
 }
 
@@ -386,11 +456,14 @@ static void horizontal_overview_select(uint32_t wid,pid_t pid)
     if(chosen && view && window_manager_find_managed_window(&g_window_manager,chosen)==view)
         target=hstrip_center_offset(chosen->strip_world_x,chosen->strip_width,hwm_bounds(view).size.width);
     SLSDisableUpdate(g_connection);
+    scripting_addition_batch_begin();
     for(size_t i=0;i<hwm_overview_count;i++) {
         HWMNativeOverviewWindow *item=&hwm_overview_windows[i];
         hwm_overview_reset_transform(item);
     }
     if(view) { hwm_scroll(view,target,false); hwm_layout(view,false); hwm_render(view,hwm_now()+hwm_duration+1); }
+    // The windows' resting places are measured next, so they must have arrived.
+    if(!scripting_addition_batch_flush()) ++hwm_move_failures;
     for(size_t i=0;i<hwm_overview_count;i++) {
         HWMNativeOverviewWindow *item=&hwm_overview_windows[i]; struct window *w=hwm_overview_find(item);
         if(!w) continue;
@@ -399,6 +472,7 @@ static void horizontal_overview_select(uint32_t wid,pid_t pid)
         item->destination=hwm_overview_local(item->original);
         hwm_overview_transform(item,item->close_from);
     }
+    if(!scripting_addition_batch_end()) ++hwm_move_failures;
     SLSReenableUpdate(g_connection);
     hwm_overview_animation_start=hwm_now(); hwm_overview_animating=true; hwm_wake();
 }
@@ -420,8 +494,8 @@ static void hwm_overview_gesture(CGEventRef event)
         hwm_overview_animating=false;
     }
     if(!hwm_overview_active || !hwm_overview_gesture_active) return;
-    double gesture_now=hwm_now();
-    hwm_overview_gesture_time=gesture_now;
+    double gesture_now=hwm_event_time(event,hwm_now());
+    hwm_overview_gesture_time=hwm_now();
     double progress=hwm_overview_gesture_closing ? 1-fabs(amount)*3 : fabs(amount)*3;
     progress=fmax(0,fmin(1,progress));
     double dt=gesture_now-hwm_overview_gesture_last_time;
@@ -435,6 +509,8 @@ static void hwm_overview_gesture(CGEventRef event)
     if((phase==4 || phase==8) && gesture_now-hwm_overview_gesture_last_time>.1) hwm_overview_gesture_velocity=0;
     if(phase==1 || phase==2) hwm_overview_set_progress(progress);
     else if(phase==4 || phase==8) {
+        // The settle starts from where the last frame drew the cards.
+        hwm_overview_position=hwm_overview_held_progress(hwm_now());
         bool open=hwm_overview_gesture_closing ? (phase==8 || progress>.7) : (phase!=8 && progress>.12);
         if(open) hwm_overview_finish_opening(); else horizontal_overview_select(0,0);
     }

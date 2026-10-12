@@ -10,6 +10,8 @@
 
 /* Written by the runtime before an overview opens; read on the main queue. */
 static double hwm_overview_scrim_strength=.38, hwm_overview_fade_duration=.3;
+/* Set by the runtime: fade a window of this process to an opacity over a duration. */
+static bool (*hwm_overview_scrim_fade)(uint32_t wid, float opacity, float duration);
 static const double HWMOverviewHoverScale=1.035;
 
 @interface HWMOverviewPanel : NSPanel
@@ -30,15 +32,16 @@ static const double HWMOverviewHoverScale=1.035;
     CAShapeLayer *_oldHalo;
     CAShapeLayer *_oldStroke;
     NSString *_search;
-    CALayer *_label;
-    CALayer *_labelIcon;
-    CATextLayer *_labelText;
+    NSMutableArray *_pills; /* one caption per card: a CALayer holding an icon layer and a text layer */
     CATextLayer *_hint;
 }
 - (void)showHint:(BOOL)visible;
 - (void)setOverview:(HorizontalWindowOverview *)overview;
 - (void)setOutline:(NSRect)outline visible:(BOOL)visible;
-- (void)setLabel:(NSString *)text icon:(NSImage *)icon card:(NSRect)card visible:(BOOL)visible;
+/* Captions for every card. Each entry has @"text", @"card" (NSValue rect) and
+ * optionally @"icon", @"dim" and @"hidden". `glide` is how long the pills take
+ * to reach their places: 0 while they are following the cards frame by frame. */
+- (void)setPills:(NSArray *)entries opacity:(double)opacity glide:(CFTimeInterval)glide;
 - (void)setSearch:(NSString *)search;
 @end
 
@@ -66,6 +69,7 @@ static const double HWMOverviewHoverScale=1.035;
     uint32_t _dragWid;
     uint64_t _session;
     uint32_t _highlighted;
+    BOOL _arrived; /* the cards are at, or within a few points of, their places in the grid */
     NSMutableDictionary *_icons;
     void (^_highlight)(uint32_t wid);
     void (^_filter)(NSArray *dimmed);
@@ -84,6 +88,7 @@ static const double HWMOverviewHoverScale=1.035;
 - (void)beginWithWindows:(NSArray *)windows screenFrame:(CGRect)frame
                selection:(void (^)(uint32_t wid, pid_t pid))selection
             cancellation:(void (^)(void))cancel;
+- (void)prepareForScreenFrame:(CGRect)frame;
 - (void)setProgress:(double)progress;
 - (void)beginClosing;
 - (void)dismissImmediately;
@@ -151,14 +156,7 @@ static BOOL hwm_overview_window_rect(NSDictionary *window, NSString *key, HWMOve
         _stroke.lineWidth=1.5; _stroke.strokeColor=[NSColor colorWithCalibratedRed:.40 green:.72 blue:1 alpha:.95].CGColor;
         _oldHalo.lineWidth=_halo.lineWidth; _oldHalo.strokeColor=_halo.strokeColor;
         _oldStroke.lineWidth=_stroke.lineWidth; _oldStroke.strokeColor=_stroke.strokeColor;
-        _label=[[CALayer alloc] init]; _labelIcon=[[CALayer alloc] init]; _labelText=[[CATextLayer alloc] init];
-        _label.backgroundColor=[NSColor colorWithCalibratedWhite:0 alpha:.66].CGColor; _label.cornerRadius=13; _label.opacity=0;
-        _label.borderWidth=1; _label.borderColor=[NSColor colorWithCalibratedWhite:1 alpha:.12].CGColor;
-        _labelIcon.contentsGravity=kCAGravityResizeAspect;
-        _labelText.fontSize=12.5; _labelText.font=(__bridge CFTypeRef)[NSFont systemFontOfSize:12.5 weight:NSFontWeightMedium];
-        _labelText.foregroundColor=NSColor.whiteColor.CGColor; _labelText.truncationMode=kCATruncationEnd;
-        _labelText.contentsScale=[[NSScreen mainScreen] backingScaleFactor] ?: 2.0;
-        [_label addSublayer:_labelIcon]; [_label addSublayer:_labelText]; [self.layer addSublayer:_label];
+        _pills=[[NSMutableArray alloc] init];
         /* One quiet line that says what the overview does, then gets out of the way. */
         _hint=[[CATextLayer alloc] init];
         _hint.string=@"click to go  ·  drag to move  ·  ⇧ ← → to move  ·  type to search  ·  esc";
@@ -207,23 +205,69 @@ static BOOL hwm_overview_window_rect(NSDictionary *window, NSString *key, HWMOve
     if(path) CGPathRelease(path);
     _outline=outline; _hasOutline=visible;
 }
-/* The selected card names itself: nothing is captioned until it is chosen. */
-- (void)setLabel:(NSString *)text icon:(NSImage *)icon card:(NSRect)card visible:(BOOL)visible
+/* Every card names itself, all the time: an icon and a title in a pill at its
+ * foot. The pills ride with the cards as the overview opens and glide with
+ * them when the cards are rearranged. */
+- (CALayer *)pillAtIndex:(NSUInteger)index
 {
-    BOOL show=visible && [text length] && card.size.width>=90.0;
-    [CATransaction begin]; [CATransaction setDisableActions:YES];
-    if (show) {
-        NSDictionary *attributes=@{NSFontAttributeName:[NSFont systemFontOfSize:12.5 weight:NSFontWeightMedium]};
-        CGFloat inset=icon ? 32.0 : 12.0;
-        CGFloat width=fmin(card.size.width-16.0, ceil([text sizeWithAttributes:attributes].width)+inset+14.0);
-        _label.frame=NSMakeRect(NSMidX(card)-width*.5, NSMaxY(card)-36.0, width, 26.0);
-        _labelIcon.frame=NSMakeRect(8.0, 5.0, 16.0, 16.0); _labelIcon.contents=icon; _labelIcon.hidden=icon==nil;
-        _labelText.frame=NSMakeRect(inset, 5.0, fmax(0.0, width-inset-10.0), 17.0); _labelText.string=text;
+    while ([_pills count] <= index) {
+        CALayer *pill=[CALayer layer], *icon=[CALayer layer]; CATextLayer *text=[CATextLayer layer];
+        pill.backgroundColor=[NSColor colorWithCalibratedWhite:0 alpha:.66].CGColor; pill.cornerRadius=13; pill.opacity=0;
+        pill.borderWidth=1; pill.borderColor=[NSColor colorWithCalibratedWhite:1 alpha:.12].CGColor;
+        icon.contentsGravity=kCAGravityResizeAspect;
+        text.fontSize=12.5; text.font=(__bridge CFTypeRef)[NSFont systemFontOfSize:12.5 weight:NSFontWeightMedium];
+        text.foregroundColor=NSColor.whiteColor.CGColor; text.truncationMode=kCATruncationEnd;
+        text.contentsScale=[[NSScreen mainScreen] backingScaleFactor] ?: 2.0;
+        [pill addSublayer:icon]; [pill addSublayer:text];
+        /* Beneath the hint, so neither covers the other's text. */
+        [self.layer insertSublayer:pill below:_hint]; [_pills addObject:pill];
     }
-    [CATransaction commit];
-    [CATransaction begin]; [CATransaction setAnimationDuration:[[NSWorkspace sharedWorkspace] accessibilityDisplayShouldReduceMotion] ? 0.0 : .12];
-    _label.opacity=show ? 1 : 0;
-    [CATransaction commit];
+    return [_pills objectAtIndex:index];
+}
+- (void)setPills:(NSArray *)entries opacity:(double)opacity glide:(CFTimeInterval)glide
+{
+    BOOL reduced=[[NSWorkspace sharedWorkspace] accessibilityDisplayShouldReduceMotion];
+    NSDictionary *attributes=@{NSFontAttributeName:[NSFont systemFontOfSize:12.5 weight:NSFontWeightMedium]};
+    NSUInteger count=[entries count];
+    for (NSUInteger index=0U; index<MAX(count, [_pills count]); ++index) {
+        CALayer *pill=[self pillAtIndex:index];
+        NSDictionary *entry=index<count ? [entries objectAtIndex:index] : nil;
+        NSString *text=[entry objectForKey:@"text"]; NSImage *icon=[entry objectForKey:@"icon"];
+        NSRect card=entry ? [[entry objectForKey:@"card"] rectValue] : NSZeroRect;
+        BOOL show=entry && ![[entry objectForKey:@"hidden"] boolValue] && [text length] && card.size.width>=90.0;
+        CALayer *iconLayer=[[pill sublayers] objectAtIndex:0]; CATextLayer *textLayer=[[pill sublayers] objectAtIndex:1];
+        BOOL appearing=pill.opacity<=0.0;
+        if (show) {
+            /* Measuring text is the only costly step, so it is done when the text changes. */
+            if (![textLayer.string isEqual:text]) {
+                [CATransaction begin]; [CATransaction setDisableActions:YES];
+                textLayer.string=text; [CATransaction commit];
+                [pill setValue:@(ceil([text sizeWithAttributes:attributes].width)) forKey:@"textWidth"];
+            }
+            CGFloat inset=icon ? 32.0 : 12.0;
+            CGFloat width=fmin(card.size.width-16.0, [[pill valueForKey:@"textWidth"] doubleValue]+inset+14.0);
+            /* A pill that was not showing has nowhere to glide from: it appears in place. */
+            [CATransaction begin];
+            if (glide<=0.0 || reduced || appearing) [CATransaction setDisableActions:YES];
+            else { [CATransaction setAnimationDuration:glide]; [CATransaction setAnimationTimingFunction:[CAMediaTimingFunction functionWithControlPoints:.22 :1 :.36 :1]]; }
+            pill.frame=NSMakeRect(round(NSMidX(card)-width*.5), round(NSMaxY(card)-36.0), width, 26.0);
+            [CATransaction commit];
+            [CATransaction begin]; [CATransaction setDisableActions:YES];
+            iconLayer.frame=NSMakeRect(8.0, 5.0, 16.0, 16.0); iconLayer.hidden=icon==nil;
+            if (iconLayer.contents != (id)icon) iconLayer.contents=icon;
+            textLayer.frame=NSMakeRect(inset, 5.0, fmax(0.0, width-inset-10.0), 17.0);
+            [CATransaction commit];
+        }
+        float target=show ? (float)(fmax(0.0, fmin(1.0, opacity))*([[entry objectForKey:@"dim"] boolValue] ? .3 : 1.0)) : 0.0f;
+        if (fabsf(pill.opacity-target) < .001f) continue;
+        /* While the cards are being followed frame by frame the fade is the
+         * gesture's own; otherwise a pill eases in and out. */
+        [CATransaction begin];
+        if (reduced || (glide<=0.0 && show && target>0.0f && target<1.0f)) [CATransaction setDisableActions:YES];
+        else [CATransaction setAnimationDuration:.14];
+        pill.opacity=target;
+        [CATransaction commit];
+    }
 }
 - (void)showHint:(BOOL)visible
 {
@@ -263,7 +307,7 @@ static BOOL hwm_overview_window_rect(NSDictionary *window, NSString *key, HWMOve
 }
 - (void)mouseMoved:(NSEvent *)event { [_overview mouseAt:[self convertPoint:[event locationInWindow] fromView:nil]]; }
 - (void)mouseDown:(NSEvent *)event { [_overview clickAt:[self convertPoint:[event locationInWindow] fromView:nil]]; }
-- (void)dealloc { [_halo release]; [_stroke release]; [_oldHalo release]; [_oldStroke release]; [_label release]; [_labelIcon release]; [_labelText release]; [_hint release]; [_search release]; [_trackingArea release]; [super dealloc]; }
+- (void)dealloc { [_halo release]; [_stroke release]; [_oldHalo release]; [_oldStroke release]; [_pills release]; [_hint release]; [_search release]; [_trackingArea release]; [super dealloc]; }
 @end
 
 @implementation HorizontalWindowOverview
@@ -313,6 +357,16 @@ static BOOL hwm_overview_window_rect(NSDictionary *window, NSString *key, HWMOve
     NSView *tint=[[[_scrim contentView] subviews] firstObject];
     tint.layer.backgroundColor=[[NSColor colorWithCalibratedWhite:0 alpha:fmax(0.0, fmin(.85, hwm_overview_scrim_strength))] CGColor];
 }
+/* The scrim is faded by the window-control helper, on the helper's own clock.
+ * Setting the blurred window's opacity from this process once per frame, to
+ * follow the fingers, was measured to be what made opening the overview drop
+ * frames: every such change queued behind the window moves being presented. */
+- (void)fadeScrimTo:(float)opacity duration:(CFTimeInterval)duration
+{
+    if ([[NSWorkspace sharedWorkspace] accessibilityDisplayShouldReduceMotion]) duration=0.0;
+    if (duration > 0.0 && hwm_overview_scrim_fade && hwm_overview_scrim_fade((uint32_t)[_scrim windowNumber], opacity, (float)duration)) return;
+    [_scrim setAlphaValue:opacity];
+}
 - (void)buildPanelForScreenFrame:(CGRect)frame
 {
     if (_panel) {
@@ -333,6 +387,14 @@ static BOOL hwm_overview_window_rect(NSDictionary *window, NSString *key, HWMOve
     [_view setWantsLayer:YES]; [[_view layer] setBackgroundColor:[[NSColor clearColor] CGColor]];
     [_view setOverview:self]; [_panel setContentView:_view];
 }
+/* Build the overlay's windows ahead of the first use, so that the first
+ * swipe up does not pay for creating them. */
+- (void)prepareForScreenFrame:(CGRect)frame
+{
+    if (_visible || !hwm_overview_valid_screen(frame)) return;
+    [self buildPanelForScreenFrame:frame];
+    if (hwm_overview_scrim_strength > 0.0) [self buildScrimForScreenFrame:frame];
+}
 - (void)installKeyMonitor
 {
     __block HorizontalWindowOverview *overview = self;
@@ -351,8 +413,8 @@ static BOOL hwm_overview_window_rect(NSDictionary *window, NSString *key, HWMOve
 {
     [_windows release]; _windows = nil; [_selection release]; _selection = nil;
     [_cancellation release]; _cancellation = nil; [_query release]; _query=nil; _hovered = -1; _selected = -1; _progress = 0.0;
-    _closing = NO; _selectionSent = NO; _cancellationSent = NO; _pressed = -1; _dragging = NO; _highlighted = 0U;
-    [_view setOutline:NSZeroRect visible:NO]; [_view setLabel:nil icon:nil card:NSZeroRect visible:NO];
+    _closing = NO; _selectionSent = NO; _cancellationSent = NO; _pressed = -1; _dragging = NO; _highlighted = 0U; _arrived = NO;
+    [_view setOutline:NSZeroRect visible:NO]; [_view setPills:nil opacity:0.0 glide:0.0];
 }
 - (void)beginWithWindows:(NSArray *)windows screenFrame:(CGRect)frame
                selection:(void (^)(uint32_t wid, pid_t pid))selection
@@ -363,9 +425,13 @@ static BOOL hwm_overview_window_rect(NSDictionary *window, NSString *key, HWMOve
     if (!hwm_overview_valid_screen(frame)) return;
     _screenFrame = frame; [self buildPanelForScreenFrame:frame];
     _windows = [windows copy]; _selection = [selection copy]; _cancellation = [cancel copy];
-    _progress = 0.0; _hovered = -1; _selected = -1; _pressed = -1; _dragging = NO; _highlighted = 0U; _visible = YES;
+    _progress = 0.0; _hovered = -1; _selected = -1; _pressed = -1; _dragging = NO; _highlighted = 0U; _visible = YES; _arrived = NO;
     [_view setOutline:NSZeroRect visible:NO]; [_view setSearch:nil]; [self installKeyMonitor];
-    if (hwm_overview_scrim_strength > 0.0) { [self buildScrimForScreenFrame:frame]; [_scrim setAlphaValue:0.0]; [_scrim orderFront:nil]; }
+    if (hwm_overview_scrim_strength > 0.0) {
+        [self buildScrimForScreenFrame:frame];
+        [self fadeScrimTo:0.0 duration:0.0]; [_scrim orderFront:nil];
+        [self fadeScrimTo:1.0 duration:hwm_overview_fade_duration*.7];
+    }
     [_panel orderFront:nil]; [_panel makeKeyWindow];
     /* Start on the window in use, so Return and the arrows begin from it. */
     for (NSUInteger index=0U; index<[_windows count]; ++index)
@@ -380,8 +446,34 @@ static BOOL hwm_overview_window_rect(NSDictionary *window, NSString *key, HWMOve
 {
     if (!_visible || _closing) return;
     _progress = isfinite(progress) ? fmax(0.0, fmin(1.0, progress)) : 0.0;
-    [_scrim setAlphaValue:_progress];
-    if (_selected >= 0) [self updateOutline];
+    /* The outline and the captions are drawn where the cards come to rest and
+     * shown as they arrive. Redrawing them under every frame of the flight
+     * would have this thread committing layer changes in step with the window
+     * moves, and WindowServer makes each wait for the other. */
+    BOOL arrived=_progress >= .9;
+    if (arrived != _arrived) { _arrived=arrived; [self updateOutline]; }
+}
+/* Every card is captioned for as long as the overview is open. */
+- (void)updatePillsGliding:(CFTimeInterval)glide
+{
+    NSMutableArray *entries=[NSMutableArray arrayWithCapacity:[_windows count]];
+    for (NSUInteger index=0U; index<[_windows count]; ++index) {
+        NSDictionary *window=[_windows objectAtIndex:index]; HWMOverviewRect frame;
+        if (![window isKindOfClass:[NSDictionary class]] || !hwm_overview_window_rect(window, @"grid", &frame)) { [entries addObject:@{@"hidden":@YES}]; continue; }
+        /* The chosen card is lifted slightly, and its caption with it. */
+        if ((NSInteger)index == _selected && !_dragging) frame=hwm_overview_inflate(frame, HWMOverviewHoverScale);
+        NSString *title=[window objectForKey:@"title"], *app=[window objectForKey:@"app"];
+        NSString *text=[title isKindOfClass:[NSString class]] && [title length] ? title : ([app isKindOfClass:[NSString class]] ? app : @"");
+        NSMutableDictionary *entry=[NSMutableDictionary dictionaryWithDictionary:@{@"text":text,
+            @"card":[NSValue valueWithRect:NSMakeRect(frame.x,frame.y,frame.width,frame.height)],
+            @"dim":@(![self matchesQueryAtIndex:index]),
+            /* A carried card is under the pointer; its caption waits until it is put down. */
+            @"hidden":@(_dragging && [[window objectForKey:@"id"] unsignedIntValue]==_dragWid)}];
+        NSImage *icon=[self iconForPID:[window objectForKey:@"pid"]];
+        if (icon) [entry setObject:icon forKey:@"icon"];
+        [entries addObject:entry];
+    }
+    [_view setPills:entries opacity:(_closing || !_visible || !_arrived) ? 0.0 : 1.0 glide:glide];
 }
 - (NSInteger)hitWindowAt:(NSPoint)point frame:(HWMOverviewRect *)frameOut
 {
@@ -415,19 +507,18 @@ static BOOL hwm_overview_window_rect(NSDictionary *window, NSString *key, HWMOve
 {
     HWMOverviewRect frame; uint32_t wid=0U;
     if (!_dragging && _selected >= 0 && (NSUInteger)_selected < [_windows count] && [self matchesQueryAtIndex:(NSUInteger)_selected] &&
-        [self frameForWindowAtIndex:(NSUInteger)_selected frame:&frame]) {
+        hwm_overview_window_rect([_windows objectAtIndex:(NSUInteger)_selected], @"grid", &frame)) {
         NSDictionary *window=[_windows objectAtIndex:(NSUInteger)_selected];
         /* The chosen card lifts slightly; the outline is drawn where it lands. */
-        frame=hwm_overview_inflate(frame, 1.0+(HWMOverviewHoverScale-1.0)*_progress);
+        frame=hwm_overview_inflate(frame, HWMOverviewHoverScale);
         NSRect card=NSMakeRect(frame.x,frame.y,frame.width,frame.height);
-        NSString *title=[window objectForKey:@"title"], *app=[window objectForKey:@"app"];
-        NSString *text=[title isKindOfClass:[NSString class]] && [title length] ? title : ([app isKindOfClass:[NSString class]] ? app : @"");
-        [_view setOutline:card visible:YES];
-        [_view setLabel:text icon:[self iconForPID:[window objectForKey:@"pid"]] card:card visible:_progress > .6];
+        [_view setOutline:card visible:_arrived];
         wid=(uint32_t)[[window objectForKey:@"id"] unsignedIntValue];
     } else {
-        [_view setOutline:NSZeroRect visible:NO]; [_view setLabel:nil icon:nil card:NSZeroRect visible:NO];
+        [_view setOutline:NSZeroRect visible:NO];
     }
+    /* A change of selection lifts one card and lowers another; their captions follow at the same pace. */
+    [self updatePillsGliding:(wid != _highlighted && _arrived) ? .14 : 0.0];
     if (wid != _highlighted) { _highlighted=wid; if (_highlight) _highlight(wid); }
 }
 /* Tell the runtime which cards the search no longer matches, so it can dim them. */
@@ -450,7 +541,7 @@ static BOOL hwm_overview_window_rect(NSDictionary *window, NSString *key, HWMOve
         [updated setObject:title forKey:@"title"]; [windows replaceObjectAtIndex:index withObject:updated];
         [_windows release]; _windows=[windows copy];
         if ([_query length]) [self publishFilter];
-        if ((NSInteger)index == _selected) [self updateOutline];
+        [self updatePillsGliding:0.0];
         return;
     }
 }
@@ -463,6 +554,8 @@ static BOOL hwm_overview_window_rect(NSDictionary *window, NSString *key, HWMOve
         if ([[[_windows objectAtIndex:index] objectForKey:@"id"] unsignedIntValue]==selected) _selected=(NSInteger)index;
     _highlighted=0U; /* Report the selection again: the runtime's cards were rebuilt too. */
     [self updateOutline];
+    /* The cards are easing to their new cells; the captions travel with them. */
+    [self updatePillsGliding:[[NSWorkspace sharedWorkspace] accessibilityDisplayShouldReduceMotion] ? 0.0 : .30];
 }
 - (BOOL)frameForWindowAtIndex:(NSUInteger)index frame:(HWMOverviewRect *)frameOut
 {
@@ -630,11 +723,8 @@ static BOOL hwm_overview_window_rect(NSDictionary *window, NSString *key, HWMOve
 {
     if (!_visible || _closing) return;
     _closing = YES; _hovered = -1; _selected = -1; _dragging = NO; _pressed = -1; ++_session; [_view showHint:NO];
-    [_view setOutline:NSZeroRect visible:NO]; [_view setLabel:nil icon:nil card:NSZeroRect visible:NO]; [_view setSearch:nil];
-    [NSAnimationContext runAnimationGroup:^(NSAnimationContext *context) {
-        context.duration=[[NSWorkspace sharedWorkspace] accessibilityDisplayShouldReduceMotion] ? 0.0 : hwm_overview_fade_duration;
-        [[_scrim animator] setAlphaValue:0.0];
-    } completionHandler:nil];
+    [_view setOutline:NSZeroRect visible:NO]; [self updatePillsGliding:0.0]; [_view setSearch:nil];
+    [self fadeScrimTo:0.0 duration:hwm_overview_fade_duration];
 }
 - (void)dismissImmediately
 {

@@ -37,6 +37,8 @@ static void horizontal_focus_requested(uint32_t wid);
 static void horizontal_focus_transition(struct window *previous,struct window *next);
 static void horizontal_overview_select(uint32_t wid, pid_t pid);
 static void horizontal_overview_done(void);
+static void horizontal_event_timed(int type,double ms);
+static uint32_t horizontal_expected_focus(struct application *application);
 
 static void horizontal_mouse_down(struct window *window, CGPoint point);
 static bool horizontal_resize_event(struct window *window);

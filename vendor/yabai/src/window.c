@@ -727,6 +727,11 @@ char *window_property_title_ts(uint32_t wid)
 
 char *window_title_ts(struct window *window)
 {
+    if (window->title_stale) {
+        window->title_stale = false;
+        if (window->title) CFRelease(window->title);
+        window->title = window_title(window);
+    }
     return window->title ? ts_cfstring_copy(window->title) : ts_string_copy("");
 }
 
