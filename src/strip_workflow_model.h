@@ -60,4 +60,38 @@ static inline bool hwm_workflow_fit_two(double first_width, double second_width,
     return true;
 }
 
+/* Share `available` among columns: in their present proportions, or equally.
+ * A column held at its minimum takes what it needs from those with room to
+ * give. Returns false, leaving widths alone, when the minima do not fit. */
+static inline bool hwm_workflow_fit_many(double *widths, const double *minima, size_t count,
+                                         double available, bool equal)
+{
+    if (!widths || !minima || count == 0U || !isfinite(available) || available <= 0.0) return false;
+    double total = 0.0, floor_total = 0.0;
+    for (size_t i = 0U; i < count; ++i) {
+        double minimum = isfinite(minima[i]) && minima[i] > 0.0 ? minima[i] : 0.0;
+        floor_total += minimum;
+        total += isfinite(widths[i]) && widths[i] > 0.0 ? widths[i] : 1.0;
+    }
+    if (floor_total > available) return false;
+    for (size_t i = 0U; i < count; ++i) {
+        double width = isfinite(widths[i]) && widths[i] > 0.0 ? widths[i] : 1.0;
+        widths[i] = equal ? available / (double)count : width * available / total;
+    }
+    for (size_t pass = 0U; pass < count; ++pass) {
+        double deficit = 0.0, spare = 0.0;
+        for (size_t i = 0U; i < count; ++i) {
+            double minimum = isfinite(minima[i]) && minima[i] > 0.0 ? minima[i] : 0.0;
+            if (widths[i] < minimum) { deficit += minimum - widths[i]; widths[i] = minimum; }
+            else spare += widths[i] - minimum;
+        }
+        if (deficit <= 1e-9 || spare <= 0.0) break;
+        for (size_t i = 0U; i < count; ++i) {
+            double minimum = isfinite(minima[i]) && minima[i] > 0.0 ? minima[i] : 0.0;
+            if (widths[i] > minimum) widths[i] -= (widths[i] - minimum) * deficit / spare;
+        }
+    }
+    return true;
+}
+
 #endif

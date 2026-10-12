@@ -12,6 +12,7 @@ static bool hwm_render(struct view *view, double now)
     // after a frame does not need that frame: only what can be seen is moved.
     // Everything is brought up to date once the strip rests.
     bool travelling=hwm_view_in_motion(view,now);
+    if(hwm_shelf_moving(now)) active=true;
     CGRect visible=CGRectInset(bounds,-120,-120);
     for (struct window_node *node = window_node_find_first_leaf(view->root); node; node = window_node_find_next_leaf(node)) {
         for (int i = 0; i < node->window_count; ++i) {
@@ -27,7 +28,7 @@ static bool hwm_render(struct view *view, double now)
                 bool measured=window->strip_tab_parked || SLSGetWindowBounds(g_connection,window->id,&observed)==kCGErrorSuccess;
                 if(!window->strip_tab_parked || !measured || (!CGRectIsNull(observed) && !CGPointEqualToPoint(parked.origin,observed.origin))) {
                     if(!scripting_addition_move_window(window->id,parked.origin.x,parked.origin.y)) { hwm_backend_ok=false; ++hwm_move_failures; }
-                    window->strip_last_frame=parked; window->strip_last_offset=offset;
+                    window->strip_last_frame=parked; window->strip_last_offset=offset; window->strip_last_shift=0;
                 }
                 window->strip_tab_parked=true; window->strip_size_pending=false;
                 if(now-window->strip_start<hwm_duration+.5) active=true;
@@ -45,7 +46,10 @@ static bool hwm_render(struct view *view, double now)
             double height = hwm_window_sample(window->strip_from_height,window->strip_height,window->strip_vel_height,elapsed,1,&unused);
             double width = hwm_window_sample(window->strip_from_width,window->strip_width,window->strip_vel_width,elapsed,1,&unused);
             if (t < 1) active = true;
-            CGRect frame = CGRectMake(round(hstrip_project_x(x,offset,bounds.origin.x,1000000)), round(bounds.origin.y+y), round(width), round(height));
+            // Each strip is drawn at its own camera position, the strips out of view further down.
+            int shelf = hwm_shelf_of(window);
+            double own_offset = shelf==hwm_shelf ? offset : hwm_shelf_offsets[shelf], shift = hwm_shelf_shift(view,shelf,now);
+            CGRect frame = CGRectMake(round(hstrip_project_x(x,own_offset,bounds.origin.x,1000000)), round(bounds.origin.y+y+shift), round(width), round(height));
             CGRect last = window->strip_last_frame;
             bool resize = CGRectIsNull(last) || fabs(last.size.width-frame.size.width) >= 1 || fabs(last.size.height-frame.size.height) >= 1;
             bool move = resize || CGRectIsNull(last) || !CGPointEqualToPoint(last.origin, frame.origin);
@@ -68,7 +72,8 @@ static bool hwm_render(struct view *view, double now)
                     return false;
                 }
                 window->strip_last_frame = frame;
-                window->strip_last_offset = offset;
+                window->strip_last_offset = own_offset;
+                window->strip_last_shift = shift;
             }
             if (resize) {
                 ++hwm_resize_operations;
@@ -112,7 +117,7 @@ static bool hwm_render(struct view *view, double now)
 static bool hwm_view_in_motion(struct view *view,double now)
 {
     return view->strip_scrolling || __atomic_load_n(&__pending_gesture,__ATOMIC_ACQUIRE) ||
-           now-hwm_last_input<.15;
+           now-hwm_last_input<.15 || hwm_shelf_moving(now);
 }
 
 static bool horizontal_window_changed(struct window *window, struct view *view, bool resized)
@@ -145,7 +150,7 @@ static bool horizontal_window_changed(struct window *window, struct view *view, 
         hwm_column_width(view,window,actual.size.width);
         window->strip_full_width = false;
         window->strip_last_frame = actual;
-        window->strip_last_offset=view->strip_offset;
+        window->strip_last_offset=hwm_shelf_offset(view,hwm_shelf_of(window),now);
         hwm_layout(view,true);
     } else if (!CGRectIsNull(window->strip_last_frame) && !CGPointEqualToPoint(actual.origin,window->strip_last_frame.origin)) {
         // A delayed move notification must never invalidate the size cache.

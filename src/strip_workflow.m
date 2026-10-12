@@ -28,6 +28,7 @@ typedef struct {
     double width, saved_width, weight;
     CGRect floating_frame;
     bool full_width, floating;
+    int shelf;
     size_t order;
 } HWMUndoWindow;
 
@@ -155,7 +156,7 @@ static void hwm_workflow_note_explicit_focus(struct window *window, struct view 
     if (!view) view = hwm_view();
     if (!window || !view || view->layout != VIEW_STRIP) return;
     bool managed = hwm_workflow_in_view(view, window);
-    if (!managed && !window_check_flag(window, WINDOW_FLOAT)) return;
+    if ((!managed && !window_check_flag(window, WINDOW_FLOAT)) || window->strip_sticky) return;
     HWMWorkflowIdentity identity = hwm_workflow_identity(window);
     HWMTabColumn *tab = managed ? hwm_workflow_tab(hwm_workflow_column(window)) : NULL;
     if (tab && !hwm_workflow_same(tab->active, identity)) {
@@ -207,7 +208,7 @@ static struct window *hwm_workflow_normal_restore_target(struct view *view, stru
         !hwm_workflow_utility_index(hwm_workflow_identity(previous), NULL)) return previous;
     for (struct window_node *node = window_node_find_first_leaf(view->root); node; node = window_node_find_next_leaf(node)) {
         for (int i = 0; i < node->window_count; ++i) {
-            struct window *candidate = window_manager_find_window(&g_window_manager, node->window_list[i]);
+            struct window *candidate = hwm_tile(node->window_list[i]);
             if (candidate && candidate != except && hwm_workflow_in_view(view, candidate) &&
                 !hwm_workflow_utility_index(hwm_workflow_identity(candidate), NULL)) return candidate;
         }
@@ -267,7 +268,7 @@ static void hwm_undo_capture(void)
             captured[count++] = ((HWMUndoWindow){
                 .identity = hwm_workflow_identity(window), .column = window->strip_column,
                 .width = window->strip_width, .saved_width = window->strip_saved_width, .weight = window->strip_weight,
-                .floating_frame = frame, .full_width = window->strip_full_width, .floating = false, .order = order++
+                .floating_frame = frame, .full_width = window->strip_full_width, .floating = false, .shelf = window->strip_shelf, .order = order++
             });
         }
     }
@@ -281,7 +282,7 @@ static void hwm_undo_capture(void)
         captured[count++] = ((HWMUndoWindow){
             .identity = hwm_workflow_identity(window), .column = window->strip_column,
             .width = window->strip_width, .saved_width = window->strip_saved_width, .weight = window->strip_weight,
-            .floating_frame = frame, .full_width = window->strip_full_width, .floating = true, .order = SIZE_MAX
+            .floating_frame = frame, .full_width = window->strip_full_width, .floating = true, .shelf = window->strip_shelf, .order = SIZE_MAX
         });
     })
     HWMTabColumn *tabs = NULL;
@@ -321,6 +322,7 @@ static bool hwm_undo_restore(void)
         window->strip_saved_width = saved->saved_width;
         window->strip_weight = saved->weight > 0.0 ? saved->weight : 1.0;
         window->strip_full_width = saved->full_width;
+        window->strip_shelf = saved->shelf;
         restored = true;
     }
     /* Use only slots that currently contain a captured window. Dynamic windows
@@ -387,7 +389,7 @@ static struct window *hwm_workflow_adjacent_column(struct view *view, struct win
     bool after = false;
     for (struct window_node *node = window_node_find_first_leaf(view->root); node; node = window_node_find_next_leaf(node)) {
         for (int i = 0; i < node->window_count; ++i) {
-            struct window *candidate = window_manager_find_window(&g_window_manager, node->window_list[i]);
+            struct window *candidate = hwm_tile(node->window_list[i]);
             if (!candidate) continue;
             uint64_t candidate_column = hwm_workflow_column(candidate);
             if (candidate_column == column) { after = true; continue; }
@@ -424,7 +426,7 @@ static bool hwm_workflow_focus_row(struct view *view, struct window *window, int
     uint64_t column = hwm_workflow_column(window);
     struct window *prior = NULL, *candidate = NULL;
     for (struct window_node *node = window_node_find_first_leaf(view->root); node; node = window_node_find_next_leaf(node)) for (int i = 0; i < node->window_count; ++i) {
-        struct window *row = window_manager_find_window(&g_window_manager, node->window_list[i]);
+        struct window *row = hwm_tile(node->window_list[i]);
         if (!row || hwm_workflow_column(row) != column) continue;
         if (direction < 0 && row == window) { candidate = prior; break; }
         if (direction > 0 && prior == window) { candidate = row; break; }
@@ -496,7 +498,7 @@ static bool hwm_workflow_action(const char *name)
         struct window *target = NULL;
         uint64_t column = hwm_workflow_column(window);
         for (struct window_node *node = window_node_find_first_leaf(view->root); node && !target; node = window_node_find_next_leaf(node)) for (int i = 0; i < node->window_count; ++i) {
-            struct window *candidate = window_manager_find_window(&g_window_manager, node->window_list[i]);
+            struct window *candidate = hwm_tile(node->window_list[i]);
             if (candidate && candidate != window && hwm_workflow_column(candidate) == column) { target = candidate; break; }
         }
         if (!target) target = hwm_workflow_adjacent_column(view, window);

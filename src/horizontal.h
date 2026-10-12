@@ -44,3 +44,4 @@ static void horizontal_mouse_down(struct window *window, CGPoint point);
 static bool horizontal_resize_event(struct window *window);
 /* Set while a pointer event of that kind is queued; newer ones are dropped. */
 static _Atomic bool horizontal_moved_queued, horizontal_dragged_queued;
+static void horizontal_title_changed(struct window *window);

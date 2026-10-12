@@ -29,7 +29,10 @@
       "radius": 12,
       "active": "#66b8ff",
       "activeEnd": "#b48cff",
-      "inactive": "#ffffff24"
+      "inactive": "#ffffff24",
+      "attention": "#ffb454",
+      "travel": true,
+      "spin": 0
     },
     "animations": {
       "windows": {
@@ -42,8 +45,8 @@
       "overview": {
         "duration": 0.34
       },
-      "open": true,
-      "close": true
+      "open": "popin",
+      "close": "shrink"
     },
     "overview": {
       "dim": 0.38
@@ -54,7 +57,24 @@
     },
     "snapThreshold": 0.15,
     "swipeGain": 1,
-    "focusAfterScroll": "pointer"
+    "focusAfterScroll": "pointer",
+    "dimInactive": 0.2,
+    "strips": [
+      "main",
+      "web",
+      "chat"
+    ],
+    "verticalSwipe": "overview",
+    "attention": "badge",
+    "haptics": true,
+    "autoPip": true,
+    "wallpaper": {
+      "parallax": 0
+    },
+    "helper": {
+      "autoReload": true,
+      "command": "sudo -n /opt/homebrew/bin/yabai --load-sa"
+    }
   },
   "shortcuts": {
     "left": "mod+left",
@@ -85,13 +105,26 @@
     "reload-config": "mod+shift+r",
     "commands": "mod+shift+p",
     "move-first": "mod+shift+,",
-    "move-last": "mod+shift+."
+    "move-last": "mod+shift+.",
+    "strip-up": "mod+k",
+    "strip-down": "mod+j",
+    "send-strip-up": "mod+shift+k",
+    "send-strip-down": "mod+shift+j",
+    "strip-1": "mod+7",
+    "strip-2": "mod+8",
+    "strip-3": "mod+9",
+    "mark": "mod+'",
+    "jump-mark": "mod+;",
+    "fit-visible": "mod+-",
+    "equalize": "mod+=",
+    "sticky": "mod+s"
   },
   "appRules": {
     "com.apple.Safari": {
       "width": 0.666667,
       "floating": false,
-      "openBesideCurrent": true
+      "openBesideCurrent": true,
+      "strip": "web"
     },
     "com.apple.Notes": {
       "width": 760,
@@ -106,5 +139,23 @@
   },
   "exec": {
     "mod+shift+f": "open -a Finder"
+  },
+  "windowRules": [
+    {
+      "app": "org.mozilla.firefox",
+      "title": "^Library$",
+      "floating": true
+    },
+    {
+      "title": "Inspector",
+      "tabbed": true
+    }
+  ],
+  "jump": {
+    "mod+g": "com.mitchellh.ghostty",
+    "mod+shift+b": {
+      "app": "org.mozilla.firefox",
+      "launch": "open -a Firefox"
+    }
   }
 }

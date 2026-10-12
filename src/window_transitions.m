@@ -1,6 +1,8 @@
 /* Display-clock transitions for floating windows, opening, and safe closure. */
 static double hwm_pop_duration=.22;
-static bool hwm_open_animation=true, hwm_close_shrink=true;
+static bool hwm_open_animation=true, hwm_close_shrink=true, hwm_close_fade=true;
+static int hwm_open_style;  /* 0 grows in, 1 rises into place, 2 only fades */
+static int hwm_close_style; /* 1 sinks as it fades */
 
 static CGRect hwm_mix_frame(CGRect from,CGRect to,double p)
 {
@@ -119,10 +121,16 @@ static bool hwm_render_pops(double now)
             if((elapsed>.03 && !hwm_resize_busy(w)) || elapsed>.33) {
                 w->strip_pop=2; w->strip_pop_start=now; elapsed=0;
                 scripting_addition_set_opacity(w->id,hwm_window_alpha(w),hwm_pop_duration);
+                if(hwm_open_style==1 && window_manager_find_managed_window(&g_window_manager,w)) {
+                    // Rises into its slot on the same spring as any other tile movement.
+                    w->strip_from_x=w->strip_world_x; w->strip_from_y=w->strip_world_y+fmin(140,w->strip_height*.14);
+                    w->strip_from_width=w->strip_width; w->strip_from_height=w->strip_height;
+                    w->strip_vel_x=w->strip_vel_y=w->strip_vel_width=w->strip_vel_height=0; w->strip_start=now;
+                }
             } else { active=true; continue; }
         }
         if(elapsed>=hwm_pop_duration) { hwm_pop_finish(w); continue; }
-        hwm_scale_center(w->id,&w->strip_pop_scaled,.9+.1*hstrip_spring_progress(elapsed,hwm_pop_duration));
+        if(hwm_open_style==0) hwm_scale_center(w->id,&w->strip_pop_scaled,.9+.1*hstrip_spring_progress(elapsed,hwm_pop_duration));
         active=true;
     })
     return active;
@@ -144,7 +152,16 @@ static void hwm_close_animated(struct window *w)
     w->strip_close_pending=true;
     // One request: the helper fades on its own clock, so the fade stays even
     // whatever else this frame is doing.
-    scripting_addition_set_opacity(w->id,0,hwm_duration>.01 ? HWMCloseDuration : 0);
+    scripting_addition_set_opacity(w->id,0,hwm_duration>.01 && hwm_close_fade ? HWMCloseDuration : 0);
+    if(hwm_close_style==1 && hwm_duration>.01 && w->strip_close_ghost) {
+        // A ghost has left the layout, so its own spring is free to carry it down.
+        double elapsed=hwm_now()-w->strip_start, unused;
+        w->strip_from_x=hwm_window_sample(w->strip_from_x,w->strip_world_x,w->strip_vel_x,elapsed,hwm_window_zeta,&unused);
+        w->strip_from_y=hwm_window_sample(w->strip_from_y,w->strip_world_y,w->strip_vel_y,elapsed,hwm_window_zeta,&unused);
+        w->strip_from_width=w->strip_width; w->strip_from_height=w->strip_height;
+        w->strip_world_x=w->strip_from_x; w->strip_world_y=w->strip_from_y+fmin(120,w->strip_height*.12);
+        w->strip_vel_x=w->strip_vel_y=w->strip_vel_width=w->strip_vel_height=0; w->strip_start=hwm_now();
+    }
     hwm_wake();
 }
 

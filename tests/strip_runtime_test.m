@@ -38,6 +38,7 @@ struct window {
     double strip_float_start,strip_close_start;
     float strip_close_alpha;
     double strip_pop_start; int strip_pop; bool strip_pop_scaled,strip_close_scaled,strip_close_ghost;
+    int strip_shelf; double strip_last_shift; float strip_rule_alpha;
 };
 struct window_node { int window_count; uint32_t window_list[1]; struct window_node *next; struct area area; };
 struct view { int layout,window_gap; struct window_node *root; double strip_offset; bool strip_scrolling; };
@@ -116,6 +117,7 @@ static void reset(void)
     clock_now=10; hwm_last_input=0; __pending_gesture=false;
     hwm_move_failures=0; hwm_resize_operations=0; ax_calls=0; moves=0; disable_calls=0; update_depth=0;
     hwm_backend_ok=true; move_fails=false;
+    hwm_shelf=0; hwm_shelf_from=0; hwm_shelf_start=-100; hwm_shelf_holding=false; memset(hwm_shelf_offsets,0,sizeof(hwm_shelf_offsets));
     g_mouse_state.window=NULL; close_calls=0; hwm_edge_window=0; hwm_edge_neighbor=0; undo_captures=0;
     for(int i=0;i<4;i++) {
         windows[i].id=i+1; windows[i].application=&application;
@@ -366,8 +368,34 @@ static void test_spring_continuity(void)
     assert(fabs(hstrip_spring(x,100,velocity,2,22,&v2)-100)<.001);
 }
 
+/* Strips are stacked: each is laid out on its own, keeps its own camera, and
+ * the ones out of view sit off the bottom of the screen, never above the top. */
+static void test_stacked_strips(void)
+{
+    reset();
+    windows[2].strip_shelf=1; windows[3].strip_shelf=1;
+    hwm_shelf_offsets[1]=40;
+    hwm_layout(&view,false); clock_now+=1; hwm_render(&view,clock_now);
+    // Each strip starts again from the left wall.
+    assert(windows[0].strip_world_x==0 && windows[1].strip_world_x==412 && windows[2].strip_world_x==0 && windows[3].strip_world_x==412);
+    assert(fabs(hwm_content_width-812)<.001 && fabs(hwm_shelf_content[1]-812)<.001);
+    double pitch=900+240;
+    assert(actual[0].origin.y==51 && actual[2].origin.y==51+pitch && actual[2].origin.x==12-40 && actual[3].origin.x==12+412-40);
+    // Panning the strip in view leaves the other strip where it is.
+    int before=moves; view.strip_offset=100; clock_now+=1; hwm_render(&view,clock_now);
+    assert(actual[0].origin.x==12-100 && actual[2].origin.x==12-40 && moves==before+2);
+    // Going down a strip: both glide, and the one that left upwards ends up parked below.
+    hwm_shelf_offsets[0]=view.strip_offset; hwm_shelf_from=0; hwm_shelf=1; hwm_shelf_start=clock_now; view.strip_offset=hwm_shelf_offsets[1];
+    clock_now+=hwm_duration*.4; assert(hwm_shelf_moving(clock_now)); bool active=hwm_render(&view,clock_now);
+    assert(active && actual[0].origin.y<51 && actual[0].origin.y>51-pitch && actual[2].origin.y>51 && actual[2].origin.y<51+pitch);
+    assert(fabs((actual[2].origin.y-actual[0].origin.y)-pitch)<=1);
+    clock_now+=hwm_duration; hwm_render(&view,clock_now);
+    assert(actual[2].origin.y==51 && actual[0].origin.y==51+pitch && actual[0].origin.x==12-100 && ax_calls==0);
+}
+
 int main(void)
 {
+    test_stacked_strips();
     test_tab_parking_is_move_only(); test_native_edge_resize(); test_spring_continuity();
     test_pan_and_late_notifications(); test_retarget_during_scroll();
     test_new_window_and_dynamic_stack(); test_failure_releases_compositor();

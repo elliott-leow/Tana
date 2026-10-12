@@ -9,7 +9,10 @@ static NSDictionary *hwm_default_shortcuts(void)
       @"utility-mark":@"ctrl+alt+shift+space",@"utility":@"ctrl+alt+space",@"tabs":@"alt+cmd+t",@"overview":@"alt+cmd+o",
       // The Mission Control keys show Tana's overview: Mission Control itself lays every window of the
       // strip out as if it were on screen, which is no picture of the strip at all.
-      @"overview-mission":@"ctrl+up",@"overview-close":@"ctrl+down",@"commands":@"ctrl+alt+p"};
+      @"overview-mission":@"ctrl+up",@"overview-close":@"ctrl+down",@"commands":@"ctrl+alt+p",
+      @"strip-up":@"alt+cmd+k",@"strip-down":@"alt+cmd+j",@"send-strip-up":@"shift+alt+cmd+k",@"send-strip-down":@"shift+alt+cmd+j",
+      @"strip-1":@"alt+cmd+1",@"strip-2":@"alt+cmd+2",@"strip-3":@"alt+cmd+3",@"strip-4":@"alt+cmd+4",
+      @"mark":@"alt+cmd+m",@"jump-mark":@"alt+cmd+'",@"fit-visible":@"alt+cmd+-",@"equalize":@"shift+alt+cmd+=",@"sticky":@"alt+cmd+p"};
 }
 static NSArray *hwm_width_presets(void)
 {
@@ -45,8 +48,15 @@ static bool hwm_config_reload(bool announce)
     hwm_window_zeta=1-[snapshot numberAt:@"animations.windows.bounce" fallback:0 minimum:0 maximum:.6];
     hwm_scroll_omega=[snapshot numberAt:@"animations.scroll.speed" fallback:22 minimum:8 maximum:60];
     hwm_overview_duration=fmax(.001,[snapshot numberAt:@"animations.overview.duration" fallback:.34 minimum:.05 maximum:1.5]*hwm_motion_scale);
-    hwm_open_animation=[snapshot boolAt:@"animations.open" fallback:YES];
-    hwm_close_shrink=[snapshot boolAt:@"animations.close" fallback:YES];
+    // "open" and "close" are a style, or true/false for the default style and none.
+    NSString *opening=[[snapshot stringAt:@"animations.open" fallback:nil] lowercaseString], *closing=[[snapshot stringAt:@"animations.close" fallback:nil] lowercaseString];
+    hwm_open_animation=opening ? ![opening isEqual:@"none"] : [snapshot boolAt:@"animations.open" fallback:YES];
+    hwm_open_style=[opening isEqual:@"slide"] ? 1 : [opening isEqual:@"fade"] ? 2 : 0;
+    if(opening && ![@[@"popin",@"slide",@"fade",@"none"] containsObject:opening]) [problems addObject:@"settings.animations.open must be popin, slide, fade, none, true or false"];
+    hwm_close_shrink=closing ? [closing isEqual:@"shrink"] : [snapshot boolAt:@"animations.close" fallback:YES];
+    hwm_close_style=[closing isEqual:@"slide"] ? 1 : 0;
+    if(closing && ![@[@"shrink",@"slide",@"fade",@"none"] containsObject:closing]) [problems addObject:@"settings.animations.close must be shrink, slide, fade, none, true or false"];
+    hwm_close_fade=![closing isEqual:@"none"];
     hwm_pop_duration=fmax(.001,.22*hwm_motion_scale);
     hwm_show_map=snapshot.showStripMap;
     NSString *snap=[[snapshot stringAt:@"snap" fallback:@"center"] lowercaseString];
@@ -62,6 +72,25 @@ static bool hwm_config_reload(bool announce)
     hwm_focus_follow=[follow isEqual:@"none"] ? 0 : [follow isEqual:@"center"] ? 1 : 2;
     if(![@[@"center",@"pointer",@"none"] containsObject:follow]) [problems addObject:@"settings.focusAfterScroll must be center, pointer or none"];
     hwm_hud_enabled=[snapshot boolAt:@"hud" fallback:YES];
+    hwm_haptics=[snapshot boolAt:@"haptics" fallback:YES];
+    hwm_auto_pip=[snapshot boolAt:@"autoPip" fallback:YES];
+    NSString *vertical=[[snapshot stringAt:@"verticalSwipe" fallback:@"overview"] lowercaseString];
+    hwm_vertical_mode=[vertical isEqual:@"strips"] ? 1 : [vertical isEqual:@"strips-reversed"] ? 2 : 0;
+    if(![@[@"overview",@"strips",@"strips-reversed"] containsObject:vertical]) [problems addObject:@"settings.verticalSwipe must be overview, strips or strips-reversed"];
+    NSMutableArray *names=[NSMutableArray array]; id strips=[snapshot hasValueAt:@"strips"] ? [snapshot valueAt:@"strips"] : nil;
+    if(strips && ![strips isKindOfClass:[NSArray class]]) [problems addObject:@"settings.strips must be a list of names"];
+    else for(id name in strips) if([name isKindOfClass:[NSString class]] && [name length] && names.count<HWM_SHELVES) [names addObject:name];
+    [hwm_shelf_names release]; hwm_shelf_names=[names copy];
+    NSString *attention=[[snapshot stringAt:@"attention" fallback:@"badge"] lowercaseString];
+    hwm_attention_mode=[attention isEqual:@"off"] ? 0 : [attention isEqual:@"title"] ? 2 : [attention isEqual:@"both"] ? 3 : 1;
+    if(![@[@"off",@"badge",@"title",@"both"] containsObject:attention]) [problems addObject:@"settings.attention must be badge, title, both or off"];
+    hwm_helper_auto=[snapshot boolAt:@"helper.autoReload" fallback:YES];
+    NSString *loader=[snapshot stringAt:@"helper.command" fallback:@"sudo -n /opt/homebrew/bin/yabai --load-sa"];
+    [hwm_helper_command release]; hwm_helper_command=[loader copy];
+    hwm_dim_strength=[snapshot numberAt:@"dimInactive" fallback:0 minimum:0 maximum:.7];
+    hwm_border_travel=[snapshot boolAt:@"border.travel" fallback:YES];
+    hwm_border_spin=[snapshot numberAt:@"border.spin" fallback:0 minimum:0 maximum:120];
+    hwm_parallax=[snapshot numberAt:@"wallpaper.parallax" fallback:0 minimum:0 maximum:.3];
     hwm_hot_reload=[snapshot boolAt:@"hotReload" fallback:YES];
     NSString *terminal=[snapshot stringAt:@"commands.terminal" fallback:nil],*browser=[snapshot stringAt:@"commands.browser" fallback:nil];
     [hwm_terminal_command release]; hwm_terminal_command=[terminal copy];
@@ -77,6 +106,9 @@ static bool hwm_config_reload(bool announce)
     memcpy(active2,active,sizeof(active)); if(![snapshot hasValueAt:@"border.active"]) { active2[0]=.71; active2[1]=.55; active2[2]=1; }
     hwm_config_color(snapshot,@"border.activeEnd",active2,problems);
     hwm_config_color(snapshot,@"border.inactive",inactive,problems);
+    double wanted[4]={1,.71,.33,1};
+    hwm_config_color(snapshot,@"border.attention",wanted,problems);
+    memcpy(hwm_border_attention,wanted,sizeof(wanted));
     memcpy(hwm_border_active,active,sizeof(active)); memcpy(hwm_border_active_end,active2,sizeof(active2)); memcpy(hwm_border_inactive,inactive,sizeof(inactive));
     hwm_border_generation++;
     hwm_overview_dim=[snapshot numberAt:@"overview.dim" fallback:.38 minimum:0 maximum:.85];
@@ -144,8 +176,8 @@ static bool hwm_place_center_gap(struct view *view,struct window *w,CGRect bound
     double *lefts=calloc(capacity?capacity:1,sizeof(double)),*widths=calloc(capacity?capacity:1,sizeof(double));
     uint32_t *firsts=calloc(capacity?capacity:1,sizeof(uint32_t));
     if(lefts && widths && firsts) for(struct window_node *n=window_node_find_first_leaf(view->root);n;n=window_node_find_next_leaf(n)) for(int i=0;i<n->window_count;i++) {
-        struct window *other=window_manager_find_window(&g_window_manager,n->window_list[i]);
-        if(!other || other==w || !other->strip_initialized || (count && hwm_column_of(other)==last)) continue;
+        struct window *other=hwm_tile(n->window_list[i]);
+        if(!other || other==w || other->strip_close_ghost || !other->strip_initialized || (count && hwm_column_of(other)==last)) continue;
         last=hwm_column_of(other); lefts[count]=other->strip_world_x; widths[count]=other->strip_width; firsts[count++]=other->id;
     }
     bool placed=false;
@@ -157,41 +189,136 @@ static bool hwm_place_center_gap(struct view *view,struct window *w,CGRect bound
     free(lefts); free(widths); free(firsts);
     return placed;
 }
-static void hwm_apply_app_rule_now(struct window *w)
+/* A browser's detached video: floated, pinned to every strip, tucked into a corner. */
+static bool hwm_title_is_pip(NSString *title)
+{
+    static NSRegularExpression *pattern;
+    if(!pattern) pattern=[[NSRegularExpression regularExpressionWithPattern:@"^Picture[- ]in[- ]Picture$" options:NSRegularExpressionCaseInsensitive error:NULL] retain];
+    return title.length && [pattern firstMatchInString:title options:0 range:NSMakeRange(0,title.length)];
+}
+/* What the rules say about a window. The title is only asked for when a rule
+ * could turn on it: that question is a round trip to the application. */
+static NSDictionary *hwm_rule_for(struct window *w,TanaConfigSnapshot *snapshot)
+{
+    NSString *title=nil;
+    if(snapshot.hasTitleRules || hwm_auto_pip) { char *raw=window_title_ts(w); title=raw ? @(raw) : nil; }
+    NSDictionary *rule=[snapshot propertiesForBundleIdentifier:hwm_bundle(w) title:title];
+    if(hwm_auto_pip && !rule[@"titleMatched"] && hwm_title_is_pip(title)) {
+        NSMutableDictionary *pip=[NSMutableDictionary dictionaryWithDictionary:rule ?: @{}];
+        [pip addEntriesFromDictionary:@{@"floating":@YES,@"sticky":@YES,@"corner":@"bottom-right",@"titleMatched":@YES}];
+        rule=pip;
+    }
+    return rule;
+}
+/* Give a tile that has just joined the strip its place: beside the window it
+ * was opened from, or in the gap between columns nearest the middle of the
+ * screen. It is never left at the far end unless the configuration asks. */
+static void hwm_place_new(struct view *view,struct window *w,NSDictionary *rule)
+{
+    CGRect bounds=hwm_bounds(view);
+    bool here=hwm_shelf_of(w)==hwm_shelf, fresh=hwm_now()-w->strip_added<2.5;
+    w->strip_placed=true;
+    if(here) {
+        int mode=[rule[@"openBesideCurrent"] boolValue] ? 1 : hwm_new_placement;
+        struct window *anchor=w->strip_rule_anchor!=w->id ? hwm_tile(w->strip_rule_anchor) : NULL;
+        if(anchor && (!view_find_window_node(view,anchor->id) || anchor->strip_close_ghost)) anchor=NULL;
+        bool placed=false;
+        if([rule[@"tabbed"] boolValue] && anchor) {
+            placed=hwm_place(view,w->id,anchor->id,HSTRIP_BELOW,true,NULL);
+            if(placed) hwm_workflow_set_tab(hwm_workflow_column(anchor),hwm_workflow_identity(w));
+        } else if(rule[@"column"]) {
+            hwm_layout(view,false);
+            placed=hwm_move_column(view,w,[rule[@"column"] isEqual:@"start"] ? -2 : 2) || true;
+        } else if(mode==1 && anchor) placed=hwm_place(view,w->id,anchor->id,HSTRIP_AFTER_COLUMN,true,NULL);
+        if(!placed && mode!=2) hwm_place_center_gap(view,w,bounds);
+    }
+    hwm_layout(view,true);
+    if(!here) return;
+    if(fresh && hwm_open_animation && hwm_duration>.01) {
+        // The tile appears in its slot and grows in; neighbours slide apart around it.
+        w->strip_from_x=w->strip_world_x; w->strip_from_y=w->strip_world_y;
+        w->strip_from_width=w->strip_width; w->strip_from_height=w->strip_height;
+        w->strip_vel_x=w->strip_vel_y=w->strip_vel_width=w->strip_vel_height=0;
+        w->strip_start=hwm_now()-hwm_duration;
+        hwm_pop_open(w);
+    }
+    hwm_preserve_focus_window=w->id; hwm_preserve_focus_until=hwm_now()+.6;
+    hwm_scroll(view,hwm_center_target(view,w),true);
+}
+/* `full` is false while the engine is in the middle of tiling the window:
+ * everything but floating it can be done there, and the rest follows at once. */
+static void hwm_apply_rule(struct window *w,bool full,bool late)
 {
     if(!w) return;
+    struct view *view=hwm_view(); if(!view) return;
     TanaConfigSnapshot *snapshot=[hwm_config copySnapshot];
-    TanaAppRule *rule=[snapshot ruleForBundleIdentifier:hwm_bundle(w)];
-    struct view *view=hwm_view(); if(!view) { [snapshot release]; return; }
+    NSDictionary *rule=hwm_rule_for(w,snapshot);
+    bool by_title=snapshot.hasTitleRules || hwm_auto_pip;
+    [snapshot release];
+    // A title that arrived late only matters if a rule was waiting for it.
+    if(late && (w->strip_ruled || !rule[@"titleMatched"])) return;
     CGRect bounds=hwm_bounds(view);
-    bool first=!w->strip_placed;
-    if(rule) {
-        if(rule.width>0) w->strip_width=fmax(160,rule.widthIsFraction?rule.width*bounds.size.width:rule.width);
-        window_manager_make_window_floating(&g_space_manager,&g_window_manager,w,rule.floating,true);
-        if(rule.floating) {
-            double width=fmin(bounds.size.width,w->strip_width>0?w->strip_width:600);
-            hwm_float_to(w,CGRectMake(bounds.origin.x+(bounds.size.width-width)/2,bounds.origin.y+60,width,fmin(650,bounds.size.height-120)));
+    bool wants_float=rule[@"floating"] && [rule[@"floating"] boolValue];
+    if(!full && wants_float) return;
+    bool first=!w->strip_ruled || late, changed=false;
+    if(rule && first) {
+        if(rule[@"titleMatched"] || full) w->strip_ruled=true;
+        if([rule[@"autoWidth"] boolValue]) w->strip_width=fmax(240,fmin(bounds.size.width,w->frame.size.width));
+        else if(rule[@"width"]) { double width=[rule[@"width"] doubleValue]; w->strip_width=fmax(160,width<=1 ? width*bounds.size.width : width); }
+        if(rule[@"opacity"]) { w->strip_rule_alpha=[rule[@"opacity"] floatValue]; scripting_addition_set_opacity(w->id,w->strip_rule_alpha,.16f); w->strip_alpha=w->strip_rule_alpha; }
+        w->strip_no_border=[rule[@"noBorder"] boolValue];
+        w->strip_sticky=[rule[@"sticky"] boolValue];
+        int shelf=rule[@"strip"] ? hwm_shelf_named(rule[@"strip"]) : -1;
+        if(shelf>=0 && !w->strip_placed) w->strip_shelf=shelf;
+        changed=true;
+        if(full && rule[@"floating"]) {
+            window_manager_make_window_floating(&g_space_manager,&g_window_manager,w,wants_float,true);
+            if(wants_float) {
+                CGRect current=w->frame; SLSGetWindowBounds(g_connection,w->id,&current);
+                double width=fmin(bounds.size.width,rule[@"width"] || rule[@"autoWidth"] ? w->strip_width : fmax(240,current.size.width));
+                double height=fmin(bounds.size.height,rule[@"corner"] ? fmax(160,current.size.height) : fmin(650,bounds.size.height-120));
+                CGRect target=CGRectMake(bounds.origin.x+(bounds.size.width-width)/2,bounds.origin.y+60,width,height);
+                NSString *corner=rule[@"corner"];
+                if(corner) {
+                    target.origin.x=[corner hasSuffix:@"left"] ? bounds.origin.x+16 : CGRectGetMaxX(bounds)-width-16;
+                    target.origin.y=[corner hasPrefix:@"top"] ? bounds.origin.y+16 : CGRectGetMaxY(bounds)-height-16;
+                }
+                hwm_float_to(w,target);
+                scripting_addition_set_layer(w->id,LAYER_ABOVE);
+                w->strip_placed=true;
+            }
         }
     }
+    if(full && !rule) w->strip_ruled=!by_title;
     bool tiled=view_find_window_node(view,w->id)!=NULL;
-    if(tiled || window_check_flag(w,WINDOW_FLOAT)) w->strip_placed=true;
-    if(tiled && first) {
-        int mode=rule ? (rule.openBesideCurrent ? 1 : 2) : hwm_new_placement;
-        if(mode==1 && w->strip_rule_anchor && w->strip_rule_anchor!=w->id) hwm_place(view,w->id,w->strip_rule_anchor,HSTRIP_AFTER_COLUMN,true,NULL);
-        else if(mode==0) hwm_place_center_gap(view,w,bounds);
-        hwm_layout(view,true);
-        if(hwm_open_animation && hwm_duration>.01) {
-            // The tile appears in its slot and grows in; neighbours slide apart around it.
-            w->strip_from_x=w->strip_world_x; w->strip_from_y=w->strip_world_y;
-            w->strip_from_width=w->strip_width; w->strip_from_height=w->strip_height;
-            w->strip_vel_x=w->strip_vel_y=w->strip_vel_width=w->strip_vel_height=0;
-            w->strip_start=hwm_now()-hwm_duration;
-            hwm_pop_open(w);
-        }
-        hwm_preserve_focus_window=w->id; hwm_preserve_focus_until=hwm_now()+.6;
-        hwm_scroll(view,hwm_center_target(view,w),true);
-    } else if(rule) hwm_layout(view,true);
-    [snapshot release];
+    if(tiled && !w->strip_placed) { hwm_place_new(view,w,rule); hwm_arrangement_window_opened(); }
+    else if(changed && full) hwm_layout(view,true);
+}
+static void hwm_apply_app_rule_now(struct window *w) { hwm_apply_rule(w,true,false); }
+/* Tiles of the view that were opened since Tana started and have no place yet. */
+static void hwm_place_unplaced(struct view *view)
+{
+    static bool placing;
+    if(placing || !hwm_ready || hwm_paused) return;
+    placing=true;
+    for(struct window_node *n=window_node_find_first_leaf(view->root);n;n=window_node_find_next_leaf(n)) for(int i=0;i<n->window_count;i++) {
+        struct window *w=window_manager_find_window(&g_window_manager,n->window_list[i]);
+        if(w && !w->strip_placed && w->strip_added>0) { hwm_apply_rule(w,false,false); break; }
+    }
+    placing=false;
+}
+static void horizontal_title_changed(struct window *w)
+{
+    if(!hwm_ready || !w || !w->is_root) return;
+    // A rule that turns on the title may have had no title to go on when the window opened.
+    if(!w->strip_ruled && w->strip_added>0 && hwm_now()-w->strip_added<4) hwm_apply_rule(w,true,true);
+    if(!(hwm_attention_mode&2) || w->id==g_window_manager.focused_window_id || w->strip_attention || hwm_now()-w->strip_added<4) return;
+    // Only a window that cannot be seen needs pointing out.
+    struct view *view=hwm_view();
+    bool tile=view && view_find_window_node(view,w->id);
+    if(!tile || w->strip_close_ghost) return;
+    bool visible=hwm_shelf_of(w)==hwm_shelf && !hwm_workflow_tab_hidden(w) && !CGRectIsNull(w->strip_last_frame) && CGRectIntersectsRect(w->strip_last_frame,hwm_screen(view));
+    if(!visible) hwm_attention_set(w,true);
 }
 static void hwm_apply_app_rule(struct window *w)
 {
@@ -221,6 +348,7 @@ static bool hwm_named_action(const char *name)
     if(strcmp(name,"left") && strcmp(name,"right")) hwm_nav_flush();
     if(strcmp(name,"reload-config")==0) { hwm_config_reload(true); return true; }
     if(strncmp(name,"exec:",5)==0) { hwm_spawn(@(name+5)); return true; }
+    if(hwm_extras_action(name)) { hwm_wake(); return true; }
     // Shutdown runs from the tick, after this command has returned.
     if(strcmp(name,"quit")==0) { hwm_stop_requested=1; hwm_wake(); return true; }
     if(strcmp(name,"commands")==0 || strcmp(name,"palette")==0) {

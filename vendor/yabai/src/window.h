@@ -134,6 +134,13 @@ struct window
     double strip_ghost_time;
     float strip_alpha; /* opacity Tana last requested; 0 means untouched */
     CGRect strip_float_saved;
+    int strip_shelf;          /* which stacked strip the window lives on */
+    double strip_last_shift;  /* vertical strip shift of strip_last_frame */
+    double strip_added;       /* when Tana first saw the window */
+    float strip_rule_alpha;   /* opacity fixed by a rule; 0 means none */
+    bool strip_no_border, strip_sticky, strip_attention, strip_ruled;
+    CGRect strip_float_home;  /* resting place of a float carried off with its strip */
+    bool strip_float_homed;
 };
 
 enum window_flag

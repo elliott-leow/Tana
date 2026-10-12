@@ -973,6 +973,7 @@ static EVENT_HANDLER(WINDOW_TITLE_CHANGED)
     // terminals and browsers retitle constantly. It is fetched when something
     // next asks for it (a signal, a rule, a query) rather than on every change.
     window->title_stale = true;
+    horizontal_title_changed(window);
 
     event_signal_push(SIGNAL_WINDOW_TITLE_CHANGED, window);
 }

@@ -32,4 +32,40 @@ static void test_extended_settings(void) {
     assert([TanaBindingDescription([s.shortcuts objectForKey:@"focus-left"]) isEqual:@"⌃⌥H"]);
     [s release]; [[NSFileManager defaultManager] removeItemAtPath:path error:NULL];
 }
-int main(void) { @autoreleasepool { test_defaults(); test_malformed_is_atomic(); test_duplicates_and_invalid_numbers(); test_wrong_types_are_ignored(); test_persistence(); test_extended_settings(); puts("tana_config_test: OK"); } return 0; }
+static void test_rules_and_jump(void) {
+    NSString *path=test_path();
+    write_text(path,@"{\"appRules\":{\"com.a\":{\"width\":0.5},\"com.b\":{\"width\":\"auto\",\"opacity\":5,\"strip\":\"web\"}},"
+        "\"windowRules\":[{\"app\":\"com.a\",\"title\":\"^Mini\",\"floating\":true,\"sticky\":true,\"corner\":\"bottom-right\"},"
+        "{\"title\":\"Inspector$\",\"tabbed\":true,\"strip\":2},{\"title\":\"(\"},{\"floating\":true}],"
+        "\"jump\":{\"ctrl+alt+b\":\"org.mozilla.firefox\",\"ctrl+alt+g\":{\"app\":\"com.g\",\"launch\":\"open -na G\"},\"ctrl+alt+x\":7}}");
+    TanaConfig *config=[[[TanaConfig alloc] initWithPath:path defaultShortcuts:defaults()] autorelease]; assert([config reload:NULL]);
+    TanaConfigSnapshot *s=[config copySnapshot]; NSUInteger mod=NSEventModifierFlagControl|NSEventModifierFlagOption;
+    assert(s.hasTitleRules);
+    /* An application rule alone: the two properties it has always decided are filled in. */
+    NSDictionary *plain=[s propertiesForBundleIdentifier:@"com.a" title:@"Document"];
+    assert([plain[@"width"] doubleValue]==.5 && ![plain[@"floating"] boolValue] && [plain[@"openBesideCurrent"] boolValue] && !plain[@"titleMatched"]);
+    /* The first matching window rule overlays it. */
+    NSDictionary *mini=[s propertiesForBundleIdentifier:@"com.a" title:@"Mini Player"];
+    assert([mini[@"floating"] boolValue] && [mini[@"sticky"] boolValue] && [mini[@"corner"] isEqual:@"bottom-right"] && [mini[@"width"] doubleValue]==.5 && [mini[@"titleMatched"] boolValue]);
+    /* A rule with no "app" applies to any application; strip numbers are one-based in the file. */
+    NSDictionary *inspector=[s propertiesForBundleIdentifier:@"com.z" title:@"Web Inspector"];
+    assert([inspector[@"tabbed"] boolValue] && [inspector[@"strip"] intValue]==1);
+    assert(![s propertiesForBundleIdentifier:@"com.z" title:@"Other"] && ![s propertiesForBundleIdentifier:@"com.z" title:nil]);
+    NSDictionary *named=[s propertiesForBundleIdentifier:@"com.b" title:nil];
+    assert([named[@"autoWidth"] boolValue] && [named[@"strip"] isEqual:@"web"] && !named[@"opacity"]);
+    assert([[s actionForKeyCode:11 modifiers:mod] isEqual:@"jump:org.mozilla.firefox\t"]);
+    assert([[s actionForKeyCode:5 modifiers:mod] isEqual:@"jump:com.g\topen -na G"]);
+    /* Bad opacity, bad pattern, a rule naming nothing, and a jump with no application. */
+    assert([s.diagnostics count]==4);
+    [s release]; [[NSFileManager defaultManager] removeItemAtPath:path error:NULL];
+}
+/* The example in the repository is what people copy: it must load without a complaint. */
+static void test_example_is_clean(void) {
+    /* No defaults: this test's stand-in ones would collide with the example's own bindings. */
+    TanaConfig *config=[[[TanaConfig alloc] initWithPath:@"config.example.json" defaultShortcuts:@{}] autorelease]; assert([config reload:NULL]);
+    TanaConfigSnapshot *s=[config copySnapshot];
+    if([s.diagnostics count]) NSLog(@"%@",s.diagnostics);
+    assert([s.diagnostics count]==0 && s.hasTitleRules && [[s propertiesForBundleIdentifier:@"com.apple.Safari" title:nil][@"strip"] isEqual:@"web"]);
+    [s release];
+}
+int main(void) { @autoreleasepool { test_rules_and_jump(); test_example_is_clean(); test_defaults(); test_malformed_is_atomic(); test_duplicates_and_invalid_numbers(); test_wrong_types_are_ignored(); test_persistence(); test_extended_settings(); puts("tana_config_test: OK"); } return 0; }

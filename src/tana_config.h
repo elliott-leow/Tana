@@ -49,6 +49,8 @@ typedef NS_ENUM(NSInteger, TanaAutofocusMode) {
     NSArray *_shortcutConflicts;
     NSDictionary *_settings;
     NSArray *_diagnostics;
+    NSDictionary *_ruleProperties;
+    NSArray *_windowRules;
 }
 @property(nonatomic, readonly) double motionStrength;
 @property(nonatomic, readonly) TanaAutofocusMode autofocusMode;
@@ -65,8 +67,17 @@ typedef NS_ENUM(NSInteger, TanaAutofocusMode) {
 - (BOOL)boolAt:(NSString *)path fallback:(BOOL)fallback;
 - (NSString *)stringAt:(NSString *)path fallback:(NSString *)fallback;
 - (BOOL)hasValueAt:(NSString *)path;
+- (id)valueAt:(NSString *)path;
 - (NSString *)actionForKeyCode:(unsigned short)keyCode modifiers:(NSUInteger)modifiers;
 - (TanaAppRule *)ruleForBundleIdentifier:(NSString *)bundleIdentifier;
+/* Everything the rules say about one window, or nil when none applies: the
+ * "appRules" entry for its application overlaid with the first "windowRules"
+ * entry whose "app" and "title" both match. Keys: width, autoWidth, floating,
+ * openBesideCurrent, strip (NSNumber index or NSString name), column
+ * ("start"/"end"), tabbed, opacity, noBorder, sticky, corner, titleMatched. */
+- (NSDictionary *)propertiesForBundleIdentifier:(NSString *)bundleIdentifier title:(NSString *)title;
+/* YES when some rule can only be decided once a window has a title. */
+@property(nonatomic, readonly) BOOL hasTitleRules;
 @end
 
 @interface TanaConfig : NSObject {

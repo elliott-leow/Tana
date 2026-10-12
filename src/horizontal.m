@@ -82,6 +82,7 @@ static double hwm_event_time(CGEventRef event,double now)
     double stamp=(double)CGEventGetTimestamp(event)/1e9;
     return stamp<=now && now-stamp<.05 ? stamp : now;
 }
+static bool hwm_swiping_columns; // A swipe has already found its first column.
 static int hwm_snap = 2; // 0 free, 1 column edges, 2 centre the nearest column
 static double hwm_magnet = .1; // Pull toward a centred column while the strip is held.
 static double hwm_snap_threshold = .15; // Share of the way to the next column that commits a swipe to it.
@@ -146,11 +147,14 @@ enum { HWM_FRAME_LOG=1024 };
 static struct { double time, offset, tick_ms, latency_ms; } hwm_frame_log[HWM_FRAME_LOG];
 static struct { double time, offset; } hwm_input_log[HWM_FRAME_LOG];
 static uint64_t hwm_frame_log_count, hwm_input_log_count;
+static double hwm_helper_due; // When to run the helper's loader after a Dock restart; 0 for never.
 static void horizontal_event_timed(int type,double ms)
 {
     if(type<0 || type>=64) return;
     if((type>=DISPLAY_ADDED && type<=DISPLAY_CHANGED) || type==SPACE_CHANGED || type==DOCK_DID_RESTART || type==MENU_BAR_HIDDEN_CHANGED ||
        type==DOCK_DID_CHANGE_PREF || type==SYSTEM_WOKE) hwm_screen_stamp=-10;
+    // The helper went with the old Dock; give the new one a moment to come up.
+    if(type==DOCK_DID_RESTART) hwm_helper_due=hwm_now()+1.5;
     ++hwm_event_prof[type].count; hwm_event_prof[type].total_ms+=ms;
     if(ms>hwm_event_prof[type].max_ms) hwm_event_prof[type].max_ms=ms;
     // Anything but a frame that takes this long while the strip is animating delays the next frame.
@@ -224,10 +228,38 @@ static void hwm_apply_app_rule(struct window *window);
 static void hwm_apply_app_rule_now(struct window *window);
 static void hwm_config_begin(void);
 static void hwm_menu_refresh_bindings(void);
+static struct window *hwm_tile(uint32_t wid);
+static double hwm_rendered_offset;
+static int hwm_shelf_limit(struct view *view);
+static NSString *hwm_shelf_label(int shelf);
+static struct window_node *hwm_slot(struct window_node *node);
+static void hwm_shelf_go(int target,bool focus);
+static void hwm_shelf_gesture(CGEventRef event);
+static bool hwm_render_shelf_floats(struct view *view,double now);
+static int hwm_vertical_mode; // 0: a vertical swipe opens the overview. 1: it changes strip. 2: the same, reversed.
+static double hwm_feedback_shelf_time;
+static bool hwm_extras_action(const char *name);
+static void hwm_ipc_layout(struct view *view);
+static _Atomic int hwm_key_capture; // The next key press names a mark: 1 to set it, 2 to go to it.
+static _Atomic uint64_t hwm_key_capture_time;
+static bool hwm_mark_apply(int code,int mode);
+static void hwm_attention_apps(NSArray *pids);
+static void hwm_attention_seen(struct window *focused);
+static void hwm_attention_poll(double now);
+static void hwm_helper_reload(void);
+static void hwm_helper_tick(double now);
+static int hwm_helper_attempts;
+static bool hwm_auto_pip=true;
+static double hwm_center_target(struct view *view,struct window *w);
+static void hwm_place_unplaced(struct view *view);
+static void hwm_action(int action);
+static bool hwm_feedback_animating(double now);
+static void hwm_focus_any(struct window *w);
+static void hwm_arrangement_window_opened(void);
 
 enum hwm_action { HWM_EVENT, HWM_LEFT, HWM_RIGHT, HWM_MOVE_LEFT, HWM_MOVE_RIGHT,
                   HWM_FLOAT, HWM_FULL, HWM_CENTER, HWM_HOME, HWM_PAUSE, HWM_REFLOW, HWM_QUIT, HWM_CLOSE, HWM_TERMINAL, HWM_BROWSER,
-                  HWM_MOVE_FIRST, HWM_MOVE_LAST, HWM_OVERVIEW_FILTER, HWM_OVERVIEW_DRAG, HWM_OVERVIEW_HIGHLIGHT, HWM_OVERVIEW, HWM_OVERVIEW_GESTURE, HWM_OVERVIEW_CANCEL, HWM_OVERVIEW_POINTER, HWM_OVERVIEW_KEY, HWM_CANCEL_DRAG, HWM_NAMED_ACTION, HWM_APPLY_RULE, HWM_TAB_SELECT };
+                  HWM_MOVE_FIRST, HWM_MOVE_LAST, HWM_OVERVIEW_FILTER, HWM_OVERVIEW_DRAG, HWM_OVERVIEW_HIGHLIGHT, HWM_OVERVIEW, HWM_OVERVIEW_GESTURE, HWM_OVERVIEW_CANCEL, HWM_OVERVIEW_POINTER, HWM_OVERVIEW_KEY, HWM_CANCEL_DRAG, HWM_NAMED_ACTION, HWM_APPLY_RULE, HWM_TAB_SELECT, HWM_MARK_KEY, HWM_ATTENTION };
 
 static double hwm_now(void) { return (double) read_os_timer() / (double) read_os_freq(); }
 /* Animations are sampled for the moment the frame will be on screen, not for
@@ -325,11 +357,14 @@ static void hwm_scroll(struct view *view, double target, bool animate)
 
 #include "strip_ax_async.m"
 #include "strip_hud.m"
+#include "strip_signals.m"
 static void hwm_resize_submit(struct window *w,CGRect frame,bool full) { (void)full; hwm_ax_resize(w->id,w->ref,w->application->ref,frame.size); }
 static bool hwm_resize_busy(struct window *w) { return hwm_ax_resize_busy(w->id); }
 static void hwm_close_submit(struct window *w) { horizontal_removing(w,false); hwm_ax_close(w->ref); }
 static bool hwm_window_left_strip(struct window *w) { return hwm_space && window_space(w->id)!=hwm_space; }
 #include "strip_layout.m"
+/* The strip in view. */
+static size_t hwm_items(struct view *view, CGRect bounds, HStripColumnItem **out) { return hwm_shelf_items(view,bounds,hwm_shelf,out); }
 static void hwm_column_width(struct view *view,struct window *window,double width)
 {
     uint64_t column=window->strip_column;
@@ -346,6 +381,8 @@ static bool horizontal_flush_node(struct window_node *node)
     while (root && root->parent) root = root->parent;
     table_for (struct view *view, g_space_manager.view, {
         if (view->layout == VIEW_STRIP && view->root == root) {
+            // A window that has just become a tile is given its place before it is first drawn.
+            hwm_place_unplaced(view);
             hwm_layout(view, true);
             return true;
         }
@@ -390,7 +427,8 @@ static void horizontal_tick(void)
         hwm_last_backend_retry = start;
         struct window *w = window_manager_find_window(&g_window_manager, g_window_manager.focused_window_id);
         hwm_backend_ok = w && scripting_addition_set_layer(w->id, window_check_flag(w, WINDOW_FLOAT) ? LAYER_ABOVE : LAYER_BELOW);
-        if (!hwm_backend_ok) return;
+        if (!hwm_backend_ok) { hwm_helper_reload(); return; }
+        if(hwm_helper_attempts) { hwm_helper_attempts=0; hwm_hud(@"Window helper reconnected"); }
         hwm_layout(view, false);
     }
     if (__atomic_load_n(&__pending_gesture,__ATOMIC_RELAXED) && start-view->strip_last_time > .8) {
@@ -426,6 +464,7 @@ static void horizontal_tick(void)
     mark=hwm_prof_mark(HWM_PROF_DRAG,mark);
     bool active = hwm_render(view, frame) || edge!=NULL || hwm_drag_window!=0;
     mark=hwm_prof_mark(HWM_PROF_RENDER,mark);
+    active |= hwm_render_shelf_floats(view,frame);
     active |= hwm_render_floating(frame);
     active |= hwm_render_closing(frame);
     active |= hwm_render_pops(frame);
@@ -445,6 +484,7 @@ static void horizontal_tick(void)
     if(hwm_close_target) active=true;
     if (__atomic_load_n(&__pending_gesture,__ATOMIC_RELAXED)) active = true;
     hwm_feedback_tick(view,start);
+    active |= hwm_feedback_animating(start);
     hwm_prof_mark(HWM_PROF_FEEDBACK,mark);
     if(dragging) { ++hwm_prof_drag_ticks; hwm_prof_mark(HWM_PROF_TICK_DRAGGING,start); }
     if (!active && hwm_focus_after_scroll && hwm_backend_ok) {
@@ -457,7 +497,7 @@ static void horizontal_tick(void)
             window_manager_focus_window_without_raise(&target->application->psn,target->id);
         }
     }
-    if (!active && hwm_state_pending) hwm_save_state();
+    if (!active && hwm_state_pending) { hwm_ipc_layout(view); hwm_save_state(); }
     double elapsed = (hwm_now()-start)*1000;
     ++hwm_frames;
     if (elapsed > 8.34) ++hwm_slow_frames;
@@ -513,6 +553,12 @@ static void horizontal_focused(struct window *window, struct view *view)
     hwm_workflow_note_explicit_focus(window,view);
     hwm_hold_focus();
     scripting_addition_set_layer(window->id,window_check_flag(window,WINDOW_FLOAT)?LAYER_ABOVE:LAYER_BELOW);
+    // Focus that lands on another strip (the Dock, Command-Tab, a mark) brings that strip into view.
+    if (hwm_shelf_of(window)!=hwm_shelf && ((view && view->layout==VIEW_STRIP && view_find_window_node(view,window->id)) || window->strip_float_homed)) {
+        hwm_shelf_go(hwm_shelf_of(window),false);
+        if (view && hwm_shelf==hwm_shelf_of(window) && view_find_window_node(view,window->id)) hwm_scroll(view,hwm_center_target(view,window),true);
+        return;
+    }
     // Keyboard navigation has already aimed the camera at its cursor. Focus
     // reports for windows it passed on the way must not pull the camera back.
     if (hwm_nav_window && hwm_now()-hwm_nav_time<.6) return;
@@ -537,11 +583,11 @@ static void horizontal_removing(struct window *window, bool whole_app)
     bool just_lost_focus=window->id==hwm_previous_focus && hwm_now()-hwm_previous_focus_time<.4;
     if (window->id!=g_window_manager.focused_window_id && !just_lost_focus && !hwm_close_target) return;
     struct view *view=window_manager_find_managed_window(&g_window_manager,window);
-    if(!view || view->layout!=VIEW_STRIP) return;
+    if(!view || view->layout!=VIEW_STRIP || hwm_shelf_of(window)!=hwm_shelf) return;
     struct window *best=NULL; double distance=INFINITY;
     for(struct window_node *n=window_node_find_first_leaf(view->root);n;n=window_node_find_next_leaf(n)) for(int i=0;i<n->window_count;i++) {
         struct window *w=window_manager_find_window(&g_window_manager,n->window_list[i]);
-        if(!w || w==window || w->strip_close_ghost || (whole_app && w->application==window->application)) continue;
+        if(!w || w==window || hwm_shelf_of(w)!=hwm_shelf_of(window) || w->strip_close_ghost || (whole_app && w->application==window->application)) continue;
         double d=fabs(w->strip_world_x-window->strip_world_x)+fabs(w->strip_world_y-window->strip_world_y)*.1;
         if(d<distance) { best=w; distance=d; }
     }
@@ -570,7 +616,7 @@ static struct window *hwm_neighbor_column(struct view *view,struct window *from,
     uint64_t own=hwm_column_of(from), found=0; bool seen=false;
     struct window *result=NULL;
     for(struct window_node *n=window_node_find_first_leaf(view->root);n;n=window_node_find_next_leaf(n)) for(int i=0;i<n->window_count;i++) {
-        struct window *w=window_manager_find_window(&g_window_manager,n->window_list[i]); if(!w || w->strip_close_ghost) continue;
+        struct window *w=hwm_tile(n->window_list[i]); if(!w || w->strip_close_ghost) continue;
         uint64_t column=hwm_column_of(w);
         if(column==own) { seen=true; if(direction<0) return result; continue; }
         if(direction<0) {
@@ -607,7 +653,12 @@ static struct window *hwm_nav_base(struct view *view)
 }
 /* The window a command should act on: the navigation cursor while it leads
  * the reported focus, otherwise the focused window. */
-static struct window *hwm_action_window(void) { return hwm_nav_base(hwm_view()); }
+static struct window *hwm_action_window(void)
+{
+    struct view *view=hwm_view(); struct window *w=hwm_nav_base(view);
+    // A tile of a strip that is out of view is not something a command should reach.
+    return w && view && hwm_shelf_of(w)!=hwm_shelf && view_find_window_node(view,w->id) ? NULL : w;
+}
 static void hwm_nav_to(struct view *view,struct window *target)
 {
     double now=hwm_now();
@@ -642,7 +693,7 @@ static void hwm_focus_follow_to(struct view *view,double offset)
     double x=offset+pointer.x-bounds.origin.x, y=pointer.y-bounds.origin.y, gap=view->window_gap*.5;
     struct window *target=NULL;
     for(struct window_node *n=window_node_find_first_leaf(view->root);n && !target;n=window_node_find_next_leaf(n)) for(int i=0;i<n->window_count;i++) {
-        struct window *w=window_manager_find_window(&g_window_manager,n->window_list[i]);
+        struct window *w=hwm_tile(n->window_list[i]);
         if(!w || w->strip_close_ghost || !w->strip_initialized || hwm_workflow_tab_hidden(w)) continue;
         // Half the gap on each side belongs to the nearer window, so the pointer is rarely over nothing.
         if(x<w->strip_world_x-gap || x>w->strip_world_x+w->strip_width+gap) continue;
@@ -659,12 +710,12 @@ static void hwm_focus_follow_to(struct view *view,double offset)
 }
 static void hwm_commit_order(struct view *view,HStripColumnItem *items,size_t count)
 {
-    struct window_node *slot=window_node_find_first_leaf(view->root);
+    struct window_node *slot=hwm_slot(window_node_find_first_leaf(view->root));
     for(size_t i=0;i<count && slot;i++) {
         struct window_node *found=view_find_window_node(view,(uint32_t)items[i].id);
         if(!found) continue;
         if(found!=slot) window_node_swap_window_list(found,slot);
-        slot=window_node_find_next_leaf(slot);
+        slot=hwm_slot(window_node_find_next_leaf(slot));
     }
 }
 /* Move the focused window's whole column: -1/+1 swap it with the neighbouring
@@ -859,6 +910,15 @@ static bool horizontal_event(CGEventType type, CGEventRef event)
         NSDictionary *tab=[[TanaFeedback shared] tabAt:CGEventGetLocation(event)];
         if(tab) { hwm_tab_click=true; event_loop_post(&g_event_loop,HORIZONTAL_INPUT,[tab retain],HWM_TAB_SELECT); return true; }
     }
+    if(type==kCGEventKeyDown && hwm_key_capture) {
+        int mode=atomic_exchange(&hwm_key_capture,0), code=(int)CGEventGetIntegerValueField(event,kCGKeyboardEventKeycode);
+        // Asked for and never answered: after a few seconds the key is an ordinary key again.
+        if(mode && code>=0 && code<128 && (double)(read_os_timer()-hwm_key_capture_time)/(double)read_os_freq()<4) {
+            hwm_keys[code]=true;
+            if(code!=53) event_loop_post(&g_event_loop,HORIZONTAL_INPUT,(void *)(uintptr_t)(code|(mode<<8)),HWM_MARK_KEY);
+            return true;
+        }
+    }
     if(hwm_overview_active && (type==kCGEventLeftMouseDown || type==kCGEventMouseMoved ||
        type==kCGEventLeftMouseDragged || type==kCGEventLeftMouseUp)) {
         // Fully transparent AppKit pixels are click-through. Route the global
@@ -940,7 +1000,7 @@ static size_t hwm_columns(struct view *view,double **lefts_out,double **widths_o
     for(struct window_node *n=window_node_find_first_leaf(view->root);n;n=window_node_find_next_leaf(n)) capacity+=n->window_count;
     double *lefts=calloc(capacity?capacity:1,sizeof(double)),*widths=calloc(capacity?capacity:1,sizeof(double));
     if(lefts && widths) for(struct window_node *n=window_node_find_first_leaf(view->root);n;n=window_node_find_next_leaf(n)) for(int i=0;i<n->window_count;i++) {
-        struct window *w=window_manager_find_window(&g_window_manager,n->window_list[i]);
+        struct window *w=hwm_tile(n->window_list[i]);
         if(!w || w->strip_close_ghost || !w->strip_initialized || (count && lefts[count-1]==w->strip_world_x)) continue;
         lefts[count]=w->strip_world_x; widths[count++]=w->strip_width;
     }
@@ -985,6 +1045,9 @@ static double hwm_magnetize(struct view *view,double raw,double viewport)
     double *lefts,*widths; size_t count=hwm_columns(view,&lefts,&widths);
     double rest=count ? hstrip_snap_center(raw,viewport,lefts,widths,count) : raw;
     free(lefts); free(widths);
+    // A detent each time the fingers carry the strip from one column's pull into the next.
+    static double last_rest;
+    if(count && fabs(rest-last_rest)>1) { if(hwm_swiping_columns) hwm_haptic(0); last_rest=rest; hwm_swiping_columns=true; }
     return hstrip_magnet(raw,rest,viewport*.16,hwm_magnet);
 }
 
@@ -995,6 +1058,8 @@ static void horizontal_input(void *context, int action)
         if(w && w->application->pid==[tab[@"pid"] intValue]) window_manager_focus_window_with_raise(&w->application->psn,w->id,w->ref);
         [tab release]; return;
     }
+    if(action==HWM_MARK_KEY) { hwm_mark_apply((int)((uintptr_t)context&0xff),(int)((uintptr_t)context>>8)); hwm_wake(); return; }
+    if(action==HWM_ATTENTION) { NSArray *pids=context; hwm_attention_apps(pids); [pids release]; return; }
     if(action==HWM_APPLY_RULE) { hwm_apply_app_rule_now(window_manager_find_window(&g_window_manager,(uint32_t)(uintptr_t)context)); return; }
     if(action==HWM_NAMED_ACTION) { hwm_named_action(context); free(context); return; }
     if(action==HWM_OVERVIEW_KEY) {
@@ -1029,7 +1094,10 @@ static void horizontal_input(void *context, int action)
         });
         CFRelease(event); return;
     }
-    if(action==HWM_OVERVIEW_GESTURE) { hwm_overview_gesture((CGEventRef)context); CFRelease(context); return; }
+    if(action==HWM_OVERVIEW_GESTURE) {
+        if(hwm_vertical_mode && !hwm_overview_active) hwm_shelf_gesture((CGEventRef)context); else hwm_overview_gesture((CGEventRef)context);
+        CFRelease(context); return;
+    }
     if (action != HWM_EVENT) { hwm_action(action); return; }
     CGEventRef event = context;
     struct view *view = hwm_view();
@@ -1068,7 +1136,7 @@ static void horizontal_input(void *context, int action)
         double stamp = hwm_event_time(event,now);
         progress*=hwm_swipe_gain;
         if (phase == 1) {
-            hwm_snap_origin = view->strip_target_offset;
+            hwm_snap_origin = view->strip_target_offset; hwm_swiping_columns = false;
             view->strip_gesture_origin = hwm_offset(view,now);
             view->strip_scrolling = false;
             view->strip_velocity = 0;
@@ -1086,7 +1154,9 @@ static void horizontal_input(void *context, int action)
             double raw=view->strip_gesture_origin+progress*width, limit=hwm_max_offset();
             hwm_scroll(view,raw<0 || raw>limit ? raw : hwm_magnetize(view,raw,width),false);
             // Past either end the strip keeps following the finger, with growing resistance.
+            bool was_inside=hwm_rubber==0;
             hwm_rubber=hwm_motion_scale==0 ? 0 : raw<0 ? -hstrip_rubber_band(-raw,width*.3) : raw>limit ? hstrip_rubber_band(raw-limit,width*.3) : 0;
+            if(was_inside && hwm_rubber) hwm_haptic(1);
             // A pause or an end of the strip starts the measurement afresh.
             if(hwm_rubber || stamp-hwm_held_time>.1) { hwm_held_count=0; hwm_held_lead=0; }
             if(!hwm_rubber) hwm_held_note(stamp,view->strip_offset);
@@ -1209,7 +1279,7 @@ static bool hwm_place(struct view *view,uint32_t source,uint32_t target,HStripPl
         free(frames);
     }
     if(valid && commit) {
-        struct window_node *slot=window_node_find_first_leaf(view->root);
+        struct window_node *slot=hwm_slot(window_node_find_first_leaf(view->root));
         for(size_t i=0;i<count;i++) {
             struct window *w=window_manager_find_window(&g_window_manager,(uint32_t)items[i].id);
             if(!w->strip_full_width || w->id==source || w->id==target) w->strip_column=items[i].column;
@@ -1217,13 +1287,14 @@ static bool hwm_place(struct view *view,uint32_t source,uint32_t target,HStripPl
             w->strip_width=items[i].width;
             if(w->id==source || w->id==target) w->strip_full_width=false;
             struct window_node *found=view_find_window_node(view,w->id);
-            if(found && slot) { if(found!=slot) window_node_swap_window_list(found,slot); slot=window_node_find_next_leaf(slot); }
+            if(found && slot) { if(found!=slot) window_node_swap_window_list(found,slot); slot=hwm_slot(window_node_find_next_leaf(slot)); }
         }
         hwm_layout(view,true);
     }
     free(items); return valid;
 }
 #include "strip_workflow.m"
+#include "strip_extras.m"
 
 /* Choose the drop zone under the pointer and show where the window will land.
  * Neighbours stay where they are until the drop: rearranging live windows
@@ -1235,7 +1306,7 @@ static void hwm_drag_update(struct view *view,struct window *window,CGPoint poin
     struct window *target=NULL; HStripPlacement placement=HSTRIP_AFTER_COLUMN;
     CGRect zone=CGRectNull; double nearest=INFINITY;
     for(struct window_node *n=window_node_find_first_leaf(view->root);n;n=window_node_find_next_leaf(n)) for(int i=0;i<n->window_count;i++) {
-        struct window *w=window_manager_find_window(&g_window_manager,n->window_list[i]);
+        struct window *w=hwm_tile(n->window_list[i]);
         if(!w || w==window || hwm_workflow_tab_hidden(w)) continue;
         CGRect f=CGRectMake(bounds.origin.x+w->strip_world_x-offset,bounds.origin.y+w->strip_world_y,w->strip_width,w->strip_height);
         if(f.size.width<=0 || f.size.height<=0) continue;
@@ -1261,6 +1332,7 @@ static void hwm_drag_update(struct view *view,struct window *window,CGPoint poin
     bool changed=hwm_drop_target!=target->id || hwm_drop_placement!=placement;
     // Validity depends only on the pair and the placement, so test it once per zone.
     if(changed && !hwm_place(view,window->id,target->id,placement,false,NULL)) { hwm_drop_target=0; hwm_preview_hide(); return; }
+    if(changed) hwm_haptic(0);
     hwm_drop_target=target->id; hwm_drop_placement=placement;
     double gap=view->window_gap; CGRect preview;
     if(placement==HSTRIP_BEFORE_COLUMN) preview=CGRectMake(zone.origin.x-gap*.5-2,bounds.origin.y,4,bounds.size.height);
@@ -1319,7 +1391,7 @@ static bool horizontal_drop(struct window *window, CGPoint point)
         window->strip_world_y=window->strip_from_y=actual.origin.y-bounds.origin.y;
         window->strip_width=window->strip_from_width=actual.size.width;
         window->strip_height=window->strip_from_height=actual.size.height;
-        window->strip_last_frame=actual; window->strip_last_offset=view->strip_offset; window->strip_start=hwm_now();
+        window->strip_last_frame=actual; window->strip_last_offset=view->strip_offset; window->strip_last_shift=0; window->strip_start=hwm_now();
         hwm_drag_window=0;
         scripting_addition_set_shadow(window->id,hwm_drag_shadow);
         scripting_addition_set_layer(window->id,LAYER_BELOW);
@@ -1393,6 +1465,42 @@ static bool hwm_number(struct token token, double *out)
 static void horizontal_command(FILE *rsp, char *message)
 {
     struct token command = get_token(&message);
+    if(token_equals(command,"subscribe")) {
+        if(!hwm_ipc_subscribe(rsp)) { daemon_fail(rsp,"too many subscribers\n"); return; }
+        fprintf(rsp,"{\"event\":\"subscribed\",\"version\":\"0.3.0\",\"strip\":%d}\n",hwm_shelf+1); fflush(rsp);
+        hwm_ipc_layout(hwm_view()); return;
+    }
+    if(token_equals(command,"mark") || token_equals(command,"jump-mark")) {
+        // With a key named the mark is used at once; without one the next key press names it.
+        struct token key=get_token(&message);
+        if(key.length>0 && key.length<16) {
+            char text[16]; memcpy(text,key.text,key.length); text[key.length]=0;
+            int code=hwm_key_code(@(text));
+            if(code<0 || !hwm_mark_apply(code,token_equals(command,"mark")?1:2)) daemon_fail(rsp,"no such mark\n");
+            return;
+        }
+    }
+    if(token_equals(command,"jump")) {
+        struct token app=get_token(&message);
+        if(app.length<1 || app.length>199) { daemon_fail(rsp,"expected an application bundle identifier\n"); return; }
+        NSString *bundle=[[[NSString alloc] initWithBytes:app.text length:app.length encoding:NSUTF8StringEncoding] autorelease];
+        struct token launch=get_token(&message);
+        NSString *command_text=launch.length ? [[[NSString alloc] initWithBytes:launch.text length:launch.length encoding:NSUTF8StringEncoding] autorelease] : nil;
+        if(bundle) hwm_jump(bundle,command_text);
+        return;
+    }
+    if(token_equals(command,"layout-list")) {
+        NSData *json=[NSJSONSerialization dataWithJSONObject:hwm_arrangement_names() options:0 error:NULL];
+        fwrite(json.bytes,1,json.length,rsp); fputc('\n',rsp); return;
+    }
+    if(token_equals(command,"layout-save") || token_equals(command,"layout-load")) {
+        struct token label=get_token(&message);
+        NSString *name=label.length ? [[[NSString alloc] initWithBytes:label.text length:label.length encoding:NSUTF8StringEncoding] autorelease] : nil;
+        bool ok=name && (token_equals(command,"layout-save") ? hwm_arrangement_save(name) : hwm_arrangement_load(name));
+        if(!ok) daemon_fail(rsp,token_equals(command,"layout-save") ? "layout names use letters, digits, spaces, - and _\n" : "no such layout\n");
+        else if(token_equals(command,"layout-save")) hwm_hud([NSString stringWithFormat:@"Layout saved as “%@”",name]);
+        return;
+    }
     if(command.length>0 && command.length<80) {
         char name[80]; memcpy(name,command.text,command.length); name[command.length]=0;
         if(hwm_named_action(name)) return;
@@ -1454,13 +1562,13 @@ static void horizontal_command(FILE *rsp, char *message)
         fprintf(rsp,"{\"tap_enabled\":%s,\"key_actions\":%llu,\"suspended\":%s,\"overview\":%s,\"overview_renderer\":\"native\",\"overview_windows\":%u,\"overview_frames\":%llu,\"overview_frames_over_8ms\":%llu,\"overview_max_frame_ms\":%.3f,\"overview_queue_max_ms\":%.3f,\"overview_flush_max_ms\":%.3f,\"overview_present_max_ms\":%.3f,\"overview_begin_ms\":%.3f,\"vertical_progress\":%.4f,\"overview_closing\":%s,\"overview_animating\":%s,\"overview_gesture_active\":%s,\"mission_control\":%s}\n",tap&&CGEventTapIsEnabled(tap)?"true":"false",(unsigned long long)hwm_key_actions,hwm_suspended?"true":"false",hwm_overview_active?"true":"false",(unsigned)hwm_overview_window_count,(unsigned long long)hwm_overview_frames,(unsigned long long)hwm_overview_slow_frames,hwm_overview_max_frame_ms,hwm_overview_queue_max_ms,hwm_overview_flush_max_ms,hwm_overview_present_max_ms,hwm_overview_begin_ms,hwm_vertical_last_progress,hwm_overview_closing?"true":"false",hwm_overview_animating?"true":"false",hwm_overview_gesture_active?"true":"false",mission_control_is_active()?"true":"false"); return;
     }
     if (token_equals(command,"status")) {
-        fprintf(rsp,"{\"version\":\"0.2.0\",\"ready\":%s,\"paused\":%s,\"backend\":%s,\"space\":%llu,\"offset\":%.3f,\"autofocus\":%s,\"frames\":%llu,\"frames_over_8ms\":%llu,\"max_frame_ms\":%.3f,\"move_failures\":%llu,\"resize_operations\":%llu,\"windows\":[",hwm_ready?"true":"false",hwm_paused?"true":"false",hwm_backend_ok?"true":"false",(unsigned long long)hwm_space,view?view->strip_offset:0,g_window_manager.ffm_mode==FFM_AUTOFOCUS?"true":"false",(unsigned long long)hwm_frames,(unsigned long long)hwm_slow_frames,hwm_max_frame_ms,(unsigned long long)hwm_move_failures,(unsigned long long)hwm_resize_operations);
+        fprintf(rsp,"{\"version\":\"0.3.0\",\"ready\":%s,\"paused\":%s,\"backend\":%s,\"space\":%llu,\"strip\":%d,\"strips\":%d,\"offset\":%.3f,\"autofocus\":%s,\"frames\":%llu,\"frames_over_8ms\":%llu,\"max_frame_ms\":%.3f,\"move_failures\":%llu,\"resize_operations\":%llu,\"windows\":[",hwm_ready?"true":"false",hwm_paused?"true":"false",hwm_backend_ok?"true":"false",(unsigned long long)hwm_space,hwm_shelf+1,view?hwm_shelf_last(view)+1:0,view?view->strip_offset:0,g_window_manager.ffm_mode==FFM_AUTOFOCUS?"true":"false",(unsigned long long)hwm_frames,(unsigned long long)hwm_slow_frames,hwm_max_frame_ms,(unsigned long long)hwm_move_failures,(unsigned long long)hwm_resize_operations);
         bool comma = false;
         if (view) for (struct window_node *n = window_node_find_first_leaf(view->root); n; n = window_node_find_next_leaf(n)) {
             for (int i=0;i<n->window_count;++i) {
                 struct window *w = window_manager_find_window(&g_window_manager,n->window_list[i]);
                 if (!w) continue;
-                fprintf(rsp,"%s{\"id\":%u,\"x\":%.2f,\"width\":%.2f,\"column\":%llu,\"y\":%.2f,\"height\":%.2f,\"full\":%s}",comma?",":"",w->id,w->strip_world_x,w->strip_width,(unsigned long long)w->strip_column,w->strip_world_y,w->strip_height,w->strip_full_width?"true":"false"); comma=true;
+                fprintf(rsp,"%s{\"id\":%u,\"x\":%.2f,\"width\":%.2f,\"column\":%llu,\"y\":%.2f,\"height\":%.2f,\"full\":%s,\"strip\":%d}",comma?",":"",w->id,w->strip_world_x,w->strip_width,(unsigned long long)w->strip_column,w->strip_world_y,w->strip_height,w->strip_full_width?"true":"false",hwm_shelf_of(w)+1); comma=true;
             }
         }
         fprintf(rsp,"]}\n"); return;
@@ -1498,7 +1606,7 @@ static void horizontal_command(FILE *rsp, char *message)
     char *names[] = {"left","right","move-left","move-right","float","full","center","home","pause","reflow"};
     int actions[] = {HWM_LEFT,HWM_RIGHT,HWM_MOVE_LEFT,HWM_MOVE_RIGHT,HWM_FLOAT,HWM_FULL,HWM_CENTER,HWM_HOME,HWM_PAUSE,HWM_REFLOW};
     for (int i=0;i<10;++i) if (token_equals(command,names[i])) { hwm_action(actions[i]); return; }
-    daemon_fail(rsp,"strip commands: status, config-status, left, right, move-left, move-right, move-first, move-last, float, full, center, home, scroll <offset>, width <points>, overview, commands, reload-config, pause, reflow, quit\n");
+    daemon_fail(rsp,"strip commands: status, config-status, subscribe, left, right, move-left, move-right, move-first, move-last, float, sticky, full, center, home, scroll <offset>, width <points>, fit-visible, equalize, strip-up, strip-down, strip-<1-9>, send-strip-up, send-strip-down, send-strip-<1-9>, mark [key], jump-mark [key], jump <bundle id> [launch command], layout-save <name>, layout-load <name>, layout-list, overview, commands, reload-config, pause, reflow, quit\n");
 }
 
 /* One list feeds both the menu and the command palette. */
@@ -1506,11 +1614,13 @@ static NSArray *hwm_command_sections(void)
 {
     return @[
       @[@"Navigate",@[@[@"overview",@"Window overview"],@[@"left",@"Focus left"],@[@"right",@"Focus right"],@[@"up",@"Focus row / tab above"],@[@"down",@"Focus row / tab below"],
-                      @[@"previous",@"Return to previous window"],@[@"center",@"Center window"],@[@"home",@"Return to left wall"]]],
+                      @[@"previous",@"Return to previous window"],@[@"center",@"Center window"],@[@"home",@"Return to left wall"],
+                      @[@"mark",@"Mark this window…"],@[@"jump-mark",@"Jump to a mark…"]]],
+      @[@"Strips",@[@[@"strip-up",@"Strip above"],@[@"strip-down",@"Strip below"],@[@"send-strip-up",@"Send column to strip above"],@[@"send-strip-down",@"Send column to strip below"]]],
       @[@"Arrange",@[@[@"move-left",@"Swap with left column"],@[@"move-right",@"Swap with right column"],@[@"move-first",@"Move to start of strip"],@[@"move-last",@"Move to end of strip"],
-                     @[@"preset-width",@"Cycle column width"],@[@"fit-two",@"Fit this column and next"],@[@"full",@"Fill screen / restore"],
+                     @[@"preset-width",@"Cycle column width"],@[@"fit-two",@"Fit this column and next"],@[@"fit-visible",@"Fit visible columns to screen"],@[@"equalize",@"Equalize visible columns"],@[@"full",@"Fill screen / restore"],
                      @[@"consume",@"Pull next window into stack"],@[@"expel",@"Push window out of stack"],@[@"tabs",@"Stack / tabs"],@[@"undo",@"Undo arrangement"]]],
-      @[@"Window",@[@[@"float",@"Float / tile"],@[@"utility-mark",@"Mark / unmark utility window"],@[@"utility",@"Summon / dismiss utility"],@[@"close",@"Close window"],
+      @[@"Window",@[@[@"float",@"Float / tile"],@[@"sticky",@"Pin floating window to every strip"],@[@"utility-mark",@"Mark / unmark utility window"],@[@"utility",@"Summon / dismiss utility"],@[@"close",@"Close window"],
                     @[@"terminal",@"New terminal"],@[@"browser",@"Open browser"]]],
       @[@"This app",@[@[@"remember-width",@"Remember current width"],@[@"remember-floating",@"Toggle open floating"],@[@"remember-beside",@"Toggle open beside current"]]],
       @[@"Tana",@[@[@"reload-config",@"Reload config file"],@[@"pause",@"Pause / resume"],@[@"reflow",@"Reflow windows"]]]];
@@ -1521,6 +1631,14 @@ static NSArray *hwm_palette_commands(void)
     TanaConfigSnapshot *snapshot=[hwm_config copySnapshot];
     for(NSArray *section in hwm_command_sections()) for(NSArray *entry in section[1])
         [commands addObject:@[entry[0],[NSString stringWithFormat:@"%@: %@",section[0],entry[1]],TanaBindingDescription(snapshot.shortcuts[entry[0]])]];
+    for(int i=0;i<HWM_SHELVES && i<(int)MAX(hwm_shelf_names.count,(NSUInteger)3);i++) {
+        NSString *name=[NSString stringWithFormat:@"strip-%d",i+1];
+        [commands addObject:@[name,[NSString stringWithFormat:@"Strips: Go to %@",hwm_shelf_label(i)],TanaBindingDescription(snapshot.shortcuts[name])]];
+    }
+    for(NSString *layout in hwm_arrangement_names()) {
+        [commands addObject:@[[@"layout-load:" stringByAppendingString:layout],[NSString stringWithFormat:@"Layout: Load “%@”",layout],@""]];
+        [commands addObject:@[[@"layout-save:" stringByAppendingString:layout],[NSString stringWithFormat:@"Layout: Update “%@” from this arrangement",layout],@""]];
+    }
     [commands addObject:@[@"quit",@"Tana: Quit and restore windows",@""]];
     [snapshot release];
     return commands;
@@ -1636,9 +1754,13 @@ static void hwm_save_state_now(bool wait)
     NSMutableArray *windows = [NSMutableArray array];
     table_for (struct window *w,g_window_manager.window, {
         if (!window_manager_is_window_eligible(w) || !window_is_standard(w)) continue;
-        [windows addObject:(@{@"id":@(w->id),@"pid":@(w->application->pid),@"width":@(w->strip_width),@"restore_width":@(w->strip_saved_width),@"full":@(w->strip_full_width),@"floating":@(window_check_flag(w,WINDOW_FLOAT)),@"column":@(w->strip_column),@"weight":@(w->strip_weight)})];
+        [windows addObject:(@{@"id":@(w->id),@"pid":@(w->application->pid),@"width":@(w->strip_width),@"restore_width":@(w->strip_saved_width),@"full":@(w->strip_full_width),@"floating":@(window_check_flag(w,WINDOW_FLOAT)),@"column":@(w->strip_column),@"weight":@(w->strip_weight),@"strip":@(hwm_shelf_of(w)),@"sticky":@(w->strip_sticky)})];
     })
-    NSDictionary *state=@{@"version":@1,@"boot":@(hwm_boot_time()),@"offset":@(view->strip_target_offset),@"order":order,@"windows":windows,@"workflow":hwm_workflow_save()};
+    NSMutableArray *offsets=[NSMutableArray array]; NSMutableDictionary *marks=[NSMutableDictionary dictionary];
+    for(int i=0;i<HWM_SHELVES;i++) [offsets addObject:@(i==hwm_shelf ? view->strip_target_offset : hwm_shelf_offsets[i])];
+    for(int i=0;i<128;i++) if(hwm_workflow_live(hwm_marks[i])) marks[@(i).stringValue]=@{@"id":@(hwm_marks[i].id),@"pid":@(hwm_marks[i].pid)};
+    NSDictionary *state=@{@"version":@1,@"boot":@(hwm_boot_time()),@"offset":@(view->strip_target_offset),@"order":order,@"windows":windows,@"workflow":hwm_workflow_save(),
+                          @"strip":@(hwm_shelf),@"stripOffsets":offsets,@"marks":marks};
     NSString *path=hwm_state_path();
     NSData *data=[NSJSONSerialization dataWithJSONObject:state options:0 error:NULL];
     if(!data) { warn("Tana: layout could not be saved.\n"); return; }
@@ -1677,6 +1799,9 @@ static void hwm_load_state(void)
         w->strip_weight=isfinite(weight)&&weight>0?weight:1;
         w->strip_saved_width=isfinite(saved) && saved>=240 && saved<=20000 ? saved : 800;
         w->strip_full_width=[entry[@"full"] isKindOfClass:[NSNumber class]] && [entry[@"full"] boolValue];
+        int shelf=[entry[@"strip"] isKindOfClass:[NSNumber class]] ? [entry[@"strip"] intValue] : 0;
+        w->strip_shelf=shelf>=0 && shelf<HWM_SHELVES ? shelf : 0;
+        w->strip_sticky=[entry[@"sticky"] isKindOfClass:[NSNumber class]] && [entry[@"sticky"] boolValue];
         if ([entry[@"floating"] isKindOfClass:[NSNumber class]])
             window_manager_make_window_floating(&g_space_manager,&g_window_manager,w,[entry[@"floating"] boolValue],true);
         [matched addObject:entry[@"id"]];
@@ -1697,6 +1822,17 @@ static void hwm_load_state(void)
         slot=window_node_find_next_leaf(slot);
     }
     hwm_workflow_load(state[@"workflow"]);
+    if ([state[@"stripOffsets"] isKindOfClass:[NSArray class]]) for (NSUInteger i=0;i<[state[@"stripOffsets"] count] && i<HWM_SHELVES;i++) {
+        id value=state[@"stripOffsets"][i];
+        if ([value isKindOfClass:[NSNumber class]] && isfinite([value doubleValue]) && [value doubleValue]>=0) hwm_shelf_offsets[i]=[value doubleValue];
+    }
+    int strip=[state[@"strip"] isKindOfClass:[NSNumber class]] ? [state[@"strip"] intValue] : 0;
+    hwm_shelf=strip>=0 && strip<HWM_SHELVES && strip<=hwm_shelf_limit(view) ? strip : 0;
+    if ([state[@"marks"] isKindOfClass:[NSDictionary class]]) for (NSString *key in state[@"marks"]) {
+        NSDictionary *mark=state[@"marks"][key]; int code=[key isKindOfClass:[NSString class]] ? key.intValue : -1;
+        if (code<0 || code>=128 || ![mark isKindOfClass:[NSDictionary class]] || ![mark[@"id"] isKindOfClass:[NSNumber class]] || ![mark[@"pid"] isKindOfClass:[NSNumber class]]) continue;
+        hwm_marks[code]=(HWMWorkflowIdentity){[mark[@"id"] unsignedIntValue],[mark[@"pid"] intValue]};
+    }
     if ([state[@"offset"] isKindOfClass:[NSNumber class]]) hwm_scroll(view,[state[@"offset"] doubleValue],false);
 }
 static void hwm_signal_stop(int signal_number) { (void)signal_number; hwm_stop_requested = 1; }
@@ -1719,6 +1855,7 @@ static void horizontal_window_added(struct window *window)
     if (!window->is_root || !window_manager_is_window_eligible(window)) return;
     hwm_remember(window);
     if (!hwm_ready) return;
+    window->strip_added=hwm_now(); window->strip_shelf=hwm_shelf;
     horizontal_destination(window,window_space(window->id));
     hwm_apply_app_rule(window);
     if (window_check_flag(window,WINDOW_FLOAT)) scripting_addition_set_layer(window->id,LAYER_ABOVE);
@@ -1767,6 +1904,7 @@ static void horizontal_begin(void)
     // New windows always join this one strip, independent of their app's saved Space.
     table_for (struct window *window, g_window_manager.window, {
         hwm_remember(window);
+        window->strip_placed=true; // Already somewhere; only windows opened from now on are given a place.
         if (window->is_root && window_manager_is_window_eligible(window) && space_is_user(window_space(window->id))) {
             if (window_space(window->id) != hwm_space) window_manager_send_window_to_space(&g_space_manager,&g_window_manager,window,hwm_space,false);
             if (window_check_flag(window,WINDOW_FLOAT)) scripting_addition_set_layer(window->id,LAYER_ABOVE);
@@ -1884,7 +2022,7 @@ static void horizontal_ordered(uint32_t wid)
 static void horizontal_reconcile(void)
 {
     __atomic_store_n(&hwm_reconcile_pending,false,__ATOMIC_RELEASE);
-    if(hwm_ready && !hwm_suspended) hwm_config_poll();
+    if(hwm_ready && !hwm_suspended) { hwm_config_poll(); hwm_helper_tick(hwm_now()); hwm_attention_poll(hwm_now()); }
     if(!hwm_ready || hwm_suspended || hwm_paused || hwm_overview_active || mission_control_is_active()) return;
     double now=hwm_now();
     // This sweep asks WindowServer about every window. It waits while frames
@@ -1952,7 +2090,12 @@ static void horizontal_focus_transition(struct window *previous,struct window *n
 {
     if(!hwm_ready || !previous || previous==next) return;
     hwm_feedback_focus(previous,next);
-    if(next) { hwm_alpha_focus=next->id; if(hwm_inactive_alpha<1 && !hwm_paused) hwm_alpha_sync(false); }
+    if(next) {
+        hwm_alpha_focus=next->id; if(hwm_inactive_alpha<1 && !hwm_paused) hwm_alpha_sync(false);
+        hwm_attention_seen(next);
+        if(hwm_ipc_count) hwm_ipc_send(@{@"event":@"focus",@"id":@(next->id),@"pid":@(next->application->pid),
+            @"app":next->application->name ? @(next->application->name) : @"",@"strip":@(hwm_shelf_of(next)+1)});
+    }
     hwm_previous_focus=previous->id; hwm_previous_focus_time=hwm_now();
     struct view *view=hwm_view();
     hwm_previous_focus_offset=view?hwm_offset(view,hwm_now()):0;

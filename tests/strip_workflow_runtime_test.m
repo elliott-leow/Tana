@@ -19,7 +19,7 @@ struct application { pid_t pid; ProcessSerialNumber psn; };
 struct window {
     uint32_t id; struct application *application; AXUIElementRef ref; unsigned flags;
     uint64_t strip_column; double strip_width, strip_saved_width, strip_weight, strip_min_width, strip_world_x;
-    bool strip_full_width; CGRect frame;
+    bool strip_full_width; CGRect frame; int strip_shelf; bool strip_sticky;
 };
 struct window_node { uint32_t window_list[8]; int window_count; struct window_node *next; };
 struct view { int layout, window_gap; uint64_t sid; double strip_target_offset; struct window_node *root; };
@@ -58,6 +58,7 @@ static CGError workflow_test_bounds(int connection, uint32_t id, CGRect *frame) 
 #define SLSGetWindowBounds workflow_test_bounds
 static NSArray *hwm_width_presets(void) { return @[@.40, @.60, @.80]; }
 
+static struct window *hwm_tile(uint32_t id) { return window_manager_find_window(&g_window_manager, id); }
 static struct window *hwm_action_window(void) { return window_manager_find_window(&g_window_manager, g_window_manager.focused_window_id); }
 #include "../src/strip_workflow.m"
 

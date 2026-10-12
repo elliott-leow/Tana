@@ -97,6 +97,23 @@ NSString *TanaBindingDescription(TanaShortcutBinding *binding)
 @implementation TanaConfigSnapshot
 @synthesize motionStrength=_motionStrength, autofocusMode=_autofocusMode, showStripMap=_showStripMap, stripWidths=_stripWidths, shortcuts=_shortcuts, shortcutConflicts=_shortcutConflicts, diagnostics=_diagnostics;
 - (void)setSettings:(NSDictionary *)settings diagnostics:(NSArray *)diagnostics { [_settings release]; _settings=[settings copy]; [_diagnostics release]; _diagnostics=[diagnostics copy]; }
+- (void)setRuleProperties:(NSDictionary *)properties windowRules:(NSArray *)windowRules { [_ruleProperties release]; _ruleProperties=[properties copy]; [_windowRules release]; _windowRules=[windowRules copy]; }
+- (BOOL)hasTitleRules { for (NSDictionary *rule in _windowRules) if ([rule objectForKey:@"titleRegex"]) return YES; return NO; }
+- (NSDictionary *)propertiesForBundleIdentifier:(NSString *)bundleIdentifier title:(NSString *)title
+{
+    NSMutableDictionary *out=nil; NSDictionary *base=bundleIdentifier ? [_ruleProperties objectForKey:bundleIdentifier] : nil;
+    if (base) out=[NSMutableDictionary dictionaryWithDictionary:base];
+    for (NSDictionary *rule in _windowRules) {
+        NSString *app=[rule objectForKey:@"app"]; NSRegularExpression *regex=[rule objectForKey:@"titleRegex"];
+        if (app && ![app isEqual:bundleIdentifier]) continue;
+        if (regex && (!title || ![regex firstMatchInString:title options:0 range:NSMakeRange(0,[title length])])) continue;
+        if (!out) out=[NSMutableDictionary dictionary];
+        for (NSString *key in rule) if (![key isEqual:@"app"] && ![key isEqual:@"titleRegex"]) [out setObject:[rule objectForKey:key] forKey:key];
+        if (regex) [out setObject:@YES forKey:@"titleMatched"];
+        break;
+    }
+    return out;
+}
 - (id)valueAt:(NSString *)path { id value=_settings; for (NSString *part in [path componentsSeparatedByString:@"."]) { if (![value isKindOfClass:[NSDictionary class]]) return nil; value=[value objectForKey:part]; } return value; }
 - (BOOL)hasValueAt:(NSString *)path { return [self valueAt:path]!=nil; }
 - (double)numberAt:(NSString *)path fallback:(double)fallback minimum:(double)minimum maximum:(double)maximum { double n; return tana_number([self valueAt:path],&n) && n>=minimum && n<=maximum ? n : fallback; }
@@ -107,8 +124,35 @@ NSString *TanaBindingDescription(TanaShortcutBinding *binding)
 - (id)copyWithZone:(NSZone *)zone { (void)zone; return [self retain]; }
 - (NSString *)actionForKeyCode:(unsigned short)keyCode modifiers:(NSUInteger)modifiers { NSUInteger wanted=modifiers&TanaShortcutModifiers; for (TanaShortcutBinding *binding in [_shortcuts allValues]) if ([binding keyCode]==keyCode && [binding modifiers]==wanted) return [binding action]; return nil; }
 - (TanaAppRule *)ruleForBundleIdentifier:(NSString *)bundleIdentifier { return [_appRules objectForKey:bundleIdentifier]; }
-- (void)dealloc { [_stripWidths release]; [_shortcuts release]; [_appRules release]; [_shortcutConflicts release]; [_settings release]; [_diagnostics release]; [super dealloc]; }
+- (void)dealloc { [_stripWidths release]; [_shortcuts release]; [_appRules release]; [_shortcutConflicts release]; [_settings release]; [_diagnostics release]; [_ruleProperties release]; [_windowRules release]; [super dealloc]; }
 @end
+
+/* The recognised parts of one rule; anything unreadable is reported and left out. */
+static NSDictionary *tana_rule_properties(NSDictionary *raw, NSString *label, NSMutableArray *diagnostics)
+{
+    NSMutableDictionary *out=[NSMutableDictionary dictionary]; double n;
+    id width=[raw objectForKey:@"width"];
+    if ([tana_lower(width) isEqual:@"auto"]) [out setObject:@YES forKey:@"autoWidth"];
+    else if (tana_number(width,&n) && n>0) [out setObject:@(n) forKey:@"width"];
+    else if (width) [diagnostics addObject:[NSString stringWithFormat:@"%@: width must be a positive number or \"auto\"",label]];
+    for (NSString *key in @[@"floating",@"openBesideCurrent",@"tabbed",@"noBorder",@"sticky"]) { id value=[raw objectForKey:key]; if (!value) continue;
+        if ([value isKindOfClass:[NSNumber class]] && CFGetTypeID((CFTypeRef)value)==CFBooleanGetTypeID()) [out setObject:value forKey:key];
+        else [diagnostics addObject:[NSString stringWithFormat:@"%@: %@ must be true or false",label,key]]; }
+    id opacity=[raw objectForKey:@"opacity"];
+    if (tana_number(opacity,&n) && n>=.1 && n<=1) [out setObject:@(n) forKey:@"opacity"];
+    else if (opacity) [diagnostics addObject:[NSString stringWithFormat:@"%@: opacity must be between 0.1 and 1",label]];
+    id strip=[raw objectForKey:@"strip"];
+    if (tana_number(strip,&n) && n>=1 && n<=9 && n==floor(n)) [out setObject:@((NSInteger)n-1) forKey:@"strip"];
+    else if ([strip isKindOfClass:[NSString class]] && [strip length]) [out setObject:strip forKey:@"strip"];
+    else if (strip) [diagnostics addObject:[NSString stringWithFormat:@"%@: strip must be a number from 1 to 9 or a strip name",label]];
+    NSString *column=tana_lower([raw objectForKey:@"column"]);
+    if ([column isEqual:@"start"] || [column isEqual:@"end"]) [out setObject:column forKey:@"column"];
+    else if ([raw objectForKey:@"column"]) [diagnostics addObject:[NSString stringWithFormat:@"%@: column must be start or end",label]];
+    NSString *corner=tana_lower([raw objectForKey:@"corner"]);
+    if ([@[@"top-left",@"top-right",@"bottom-left",@"bottom-right"] containsObject:corner ?: @""]) [out setObject:corner forKey:@"corner"];
+    else if ([raw objectForKey:@"corner"]) [diagnostics addObject:[NSString stringWithFormat:@"%@: corner must be top-left, top-right, bottom-left or bottom-right",label]];
+    return out;
+}
 
 static TanaConfigSnapshot *tana_snapshot(NSDictionary *document, NSDictionary *defaults)
 {
@@ -154,10 +198,43 @@ static TanaConfigSnapshot *tana_snapshot(NSDictionary *document, NSDictionary *d
         if ([used containsObject:key]) { [diagnostics addObject:[NSString stringWithFormat:@"exec binding \"%@\" duplicates another binding",text]]; continue; }
         [used addObject:key]; [bindings setObject:binding forKey:action];
     }
+    /* "jump": { "<binding>": "<bundle id>" | { "app": "<bundle id>", "launch": "<shell command>" } }
+     * focuses a window of that application, or starts it when it has none. */
+    NSDictionary *jump=tana_dictionary([document objectForKey:@"jump"]);
+    for (NSString *text in [[jump allKeys] sortedArrayUsingSelector:@selector(compare:)]) {
+        id target=[jump objectForKey:text]; NSString *app=[target isKindOfClass:[NSString class]] ? target : [tana_dictionary(target) objectForKey:@"app"];
+        NSString *launch=[tana_dictionary(target) objectForKey:@"launch"];
+        if (![app isKindOfClass:[NSString class]] || ![app length] || [app rangeOfString:@"\t"].location!=NSNotFound || (launch && ![launch isKindOfClass:[NSString class]])) { [diagnostics addObject:[NSString stringWithFormat:@"jump \"%@\" needs an application bundle identifier",text]]; continue; }
+        NSString *action=[NSString stringWithFormat:@"jump:%@\t%@",app,launch ?: @""];
+        TanaShortcutBinding *binding=tana_parse_binding(text,action);
+        if (!binding) { [diagnostics addObject:[NSString stringWithFormat:@"jump has an unreadable binding \"%@\"",text]]; continue; }
+        NSString *key=[NSString stringWithFormat:@"%hu:%lu",[binding keyCode],(unsigned long)[binding modifiers]];
+        if ([used containsObject:key]) { [diagnostics addObject:[NSString stringWithFormat:@"jump binding \"%@\" duplicates another binding",text]]; continue; }
+        [used addObject:key]; [bindings setObject:binding forKey:action];
+    }
     NSMutableDictionary *rules=[NSMutableDictionary dictionary]; NSDictionary *rawRules=tana_dictionary([document objectForKey:@"appRules"]);
     for (NSString *bundle in rawRules) { NSDictionary *raw=tana_dictionary([rawRules objectForKey:bundle]); double width=0; if (![bundle isKindOfClass:[NSString class]] || ![bundle length] || ![raw count]) continue; id rawWidth=[raw objectForKey:@"width"]; if (rawWidth && (!tana_number(rawWidth,&width) || width<=0)) width=0; BOOL fraction=width>0 && width<=1; [rules setObject:[[[TanaAppRule alloc] initWithBundleIdentifier:bundle width:width widthIsFraction:fraction floating:tana_bool([raw objectForKey:@"floating"],NO) openBesideCurrent:tana_bool([raw objectForKey:@"openBesideCurrent"],YES)] autorelease] forKey:bundle]; }
     TanaConfigSnapshot *snapshot=[[[TanaConfigSnapshot alloc] initWithMotion:motion autofocus:autofocus showStripMap:showStripMap widths:widths shortcuts:bindings rules:rules conflicts:conflicts] autorelease];
+    NSMutableDictionary *properties=[NSMutableDictionary dictionary];
+    for (NSString *bundle in rawRules) { NSDictionary *raw=tana_dictionary([rawRules objectForKey:bundle]); if (![bundle isKindOfClass:[NSString class]] || ![bundle length] || ![raw count]) continue;
+        NSMutableDictionary *entry=[[tana_rule_properties(raw,[NSString stringWithFormat:@"appRules \"%@\"",bundle],diagnostics) mutableCopy] autorelease];
+        /* An application rule has always decided these two, stated or not. */
+        if (![entry objectForKey:@"floating"]) [entry setObject:@NO forKey:@"floating"];
+        if (![entry objectForKey:@"openBesideCurrent"]) [entry setObject:@YES forKey:@"openBesideCurrent"];
+        [properties setObject:entry forKey:bundle]; }
+    NSMutableArray *windowRules=[NSMutableArray array]; id rawWindowRules=[document objectForKey:@"windowRules"]; NSUInteger index=0;
+    if (rawWindowRules && ![rawWindowRules isKindOfClass:[NSArray class]]) [diagnostics addObject:@"windowRules must be a list of rules"];
+    else for (id item in rawWindowRules) { NSDictionary *raw=tana_dictionary(item); NSString *label=[NSString stringWithFormat:@"windowRules[%lu]",(unsigned long)index++];
+        id app=[raw objectForKey:@"app"], title=[raw objectForKey:@"title"];
+        if (!raw || (app && (![app isKindOfClass:[NSString class]] || ![app length])) || (title && ![title isKindOfClass:[NSString class]]) || (!app && !title)) { [diagnostics addObject:[NSString stringWithFormat:@"%@ needs an \"app\" bundle identifier, a \"title\" pattern, or both",label]]; continue; }
+        NSMutableDictionary *entry=[[tana_rule_properties(raw,label,diagnostics) mutableCopy] autorelease];
+        if (title) { NSError *regexError=nil; NSRegularExpression *regex=[NSRegularExpression regularExpressionWithPattern:title options:0 error:&regexError];
+            if (!regex) { [diagnostics addObject:[NSString stringWithFormat:@"%@: title is not a valid pattern (%@)",label,[regexError localizedDescription]]]; continue; }
+            [entry setObject:regex forKey:@"titleRegex"]; }
+        if (app) [entry setObject:app forKey:@"app"];
+        [windowRules addObject:entry]; }
     [snapshot setSettings:settings ?: @{} diagnostics:diagnostics];
+    [snapshot setRuleProperties:properties windowRules:windowRules];
     return snapshot;
 }
 

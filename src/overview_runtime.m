@@ -11,6 +11,8 @@ typedef struct {
     float alpha;               /* opacity when the overview opened */
     bool dimmed;               /* faded because the search does not match it */
     bool transformed, has_last;
+    bool stepped_aside;        /* faded out so that only the chosen window is seen arriving */
+    bool returned;             /* ...and faded back in at its place in the strip */
 } HWMNativeOverviewWindow;
 
 static HWMNativeOverviewWindow *hwm_overview_windows;
@@ -39,6 +41,10 @@ static double hwm_overview_regrid_time;
 static bool hwm_overview_drag_moved;
 static CGPoint hwm_overview_drag_point, hwm_overview_drag_grab;
 static const double HWMOverviewRegrid=.32, HWMOverviewHover=.14;
+static const double HWMOverviewAside=.06; /* how long the cards not chosen take to fade away */
+/* How long the windows take to return to the strip. Choosing a window is
+ * brisk: the window is wanted now, and nothing else is there to be watched. */
+static double hwm_overview_close_span=.34;
 
 /* A window id can be reused: only touch one still owned by the process it was recorded for. */
 static bool hwm_overview_owned_by(uint32_t wid,pid_t pid)
@@ -202,6 +208,15 @@ static void hwm_overview_render(double p)
     scripting_addition_batch_begin();
     for(size_t i=0;i<hwm_overview_count;i++) {
         HWMNativeOverviewWindow *item=&hwm_overview_windows[i];
+        if(item->stepped_aside) {
+            // Gone from the grid; once unseen it is put where it lives and fades up there.
+            if(!item->returned && start-hwm_overview_animation_start>=HWMOverviewAside) {
+                item->returned=true;
+                hwm_overview_reset_transform(item);
+                if(hwm_overview_find(item)) scripting_addition_set_opacity(item->wid,item->alpha,(float)fmax(.08,hwm_overview_close_span-HWMOverviewAside));
+            }
+            continue;
+        }
         HWMOverviewRect shown=hwm_overview_closing ? hwm_overview_mix(item->close_from,item->destination,p) :
             hwm_overview_current(item,p,frame);
         hwm_overview_transform(item,shown);
@@ -255,7 +270,12 @@ static void horizontal_overview_done(void)
     if(!hwm_overview_active) return;
     SLSDisableUpdate(g_connection);
     scripting_addition_batch_begin();
-    for(size_t i=0;i<hwm_overview_count;i++) hwm_overview_reset_transform(&hwm_overview_windows[i]);
+    for(size_t i=0;i<hwm_overview_count;i++) {
+        HWMNativeOverviewWindow *item=&hwm_overview_windows[i];
+        hwm_overview_reset_transform(item);
+        // Ended early: nothing may be left invisible.
+        if(item->stepped_aside && !item->returned && hwm_overview_find(item)) scripting_addition_set_opacity(item->wid,item->alpha,0);
+    }
     hwm_overview_undim(0);
     hwm_overview_drag_wid=0; hwm_overview_drop_wid=0; hwm_preview_hide();
     hwm_overview_restore_borders();
@@ -303,9 +323,10 @@ static void hwm_overview_tick(void)
         // The settle continues at the speed the fingers were moving, so a quick
         // flick opens briskly and a slow lift eases in.
         double from=hwm_overview_closing ? 0 : hwm_overview_animation_from;
-        p=hstrip_spring(from,1,hwm_overview_release_velocity,elapsed,hstrip_spring_omega(hwm_overview_duration,1),&velocity);
+        double span=hwm_overview_closing ? hwm_overview_close_span : hwm_overview_duration;
+        p=hstrip_spring(from,1,hwm_overview_release_velocity,elapsed,hstrip_spring_omega(span,1),&velocity);
         p=fmax(0,fmin(1,p));
-        finished=elapsed>=hwm_overview_duration;
+        finished=elapsed>=span;
         if(finished) p=1;
     }
     hwm_overview_render(p);
@@ -345,6 +366,8 @@ static void hwm_overview_add(NSMutableArray *windows,NSMutableSet *seen,struct w
        w->application->is_hidden || w->strip_ordered_out) return;
     struct view *view=window_manager_find_managed_window(&g_window_manager,w);
     if((!view || view->layout!=VIEW_STRIP) && !window_check_flag(w,WINDOW_FLOAT)) return;
+    // The overview is of the strip in view; the others keep their windows.
+    if(hwm_shelf_of(w)!=hwm_shelf && (view || w->strip_float_homed)) return;
     uint8_t ordered=0; CGRect frame=CGRectNull;
     if(SLSWindowIsOrderedIn(g_connection,w->id,&ordered)!=kCGErrorSuccess || !ordered ||
        SLSGetWindowBounds(g_connection,w->id,&frame)!=kCGErrorSuccess || frame.size.width<=0 || frame.size.height<=0) return;
@@ -439,7 +462,14 @@ static void horizontal_overview_select(uint32_t wid,pid_t pid)
 {
     if(!hwm_overview_active || hwm_overview_closing) return;
     hwm_overview_gesture_active=false;
-    hwm_overview_undim(.14f);
+    struct window *picked=wid ? window_manager_find_window(&g_window_manager,wid) : NULL;
+    if(picked && (picked->application->pid!=pid || picked->strip_ordered_out)) picked=NULL;
+    // Choosing a window shows that window arriving and nothing else: the other
+    // cards fade where they are instead of all flying back to the strip.
+    bool solo=picked && hwm_motion_scale>0;
+    hwm_overview_close_span=solo ? fmin(hwm_overview_duration,.2) : hwm_overview_duration;
+    hwm_overview_fade_duration=hwm_overview_close_span;
+    if(!solo) hwm_overview_undim(.14f);
     hwm_overview_drag_wid=0; hwm_overview_drop_wid=0; hwm_preview_hide();
     double closing_now=hwm_frame_time(hwm_now());
     for(size_t i=0;i<hwm_overview_count;i++) hwm_overview_windows[i].close_from=hwm_overview_current(&hwm_overview_windows[i],hwm_overview_position,closing_now);
@@ -469,9 +499,20 @@ static void horizontal_overview_select(uint32_t wid,pid_t pid)
         if(!w) continue;
         CGRect frame=CGRectNull;
         if(SLSGetWindowBounds(g_connection,w->id,&frame)==kCGErrorSuccess) item->original=frame;
+        // A tile's move has been asked for but, with screen updates held, is not
+        // yet what WindowServer reports. Where it was sent is where it will be;
+        // measuring instead flew every window back to where it had been.
+        if(view && window_manager_find_managed_window(&g_window_manager,w)==view && !CGRectIsNull(w->strip_last_frame) && !hwm_workflow_tab_hidden(w))
+            item->original.origin=w->strip_last_frame.origin;
         item->destination=hwm_overview_local(item->original);
         hwm_overview_transform(item,item->close_from);
+        if(solo && item->wid!=picked->id) {
+            item->stepped_aside=true; item->returned=false; item->dimmed=false;
+            scripting_addition_set_opacity(item->wid,0,(float)HWMOverviewAside);
+        }
     }
+    // In front from the first frame, not only once it has landed and taken focus.
+    if(solo) scripting_addition_order_window(picked->id,1,0);
     if(!scripting_addition_batch_end()) ++hwm_move_failures;
     SLSReenableUpdate(g_connection);
     hwm_overview_animation_start=hwm_now(); hwm_overview_animating=true; hwm_wake();
