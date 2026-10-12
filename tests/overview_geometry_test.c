@@ -20,13 +20,52 @@ static void check_grid(size_t count)
     }
 }
 
+static void check_grouped_grid(void)
+{
+    HWMOverviewRect cards[5];
+    size_t groups[] = {42U, 42U, 42U, 7U, 7U};
+    HWMOverviewRect bounds = {0.0, 0.0, 1000.0, 700.0};
+    assert(hwm_overview_grouped_grid(bounds, 5U, groups, 40.0, 12.0, cards));
+    assert(cards[0].x == cards[1].x && cards[1].x == cards[2].x);
+    assert(cards[0].y < cards[1].y && cards[1].y < cards[2].y);
+    assert(cards[3].x > cards[2].x && cards[3].x == cards[4].x);
+    assert(cards[3].y < cards[4].y);
+    for (size_t index = 0U; index < 5U; ++index) {
+        assert(cards[index].x >= bounds.x && cards[index].y >= bounds.y);
+        assert(cards[index].x + cards[index].width <= bounds.x + bounds.width);
+        assert(cards[index].y + cards[index].height <= bounds.y + bounds.height);
+    }
+    groups[4] = 42U; /* A noncontiguous repeated group uses the normal grid. */
+    assert(hwm_overview_grouped_grid(bounds, 5U, groups, 40.0, 12.0, cards));
+    assert(cards[0].x != cards[1].x || cards[0].y != cards[1].y);
+}
+
+static void check_neighbors(void)
+{
+    /* Two rows of three; the bottom row is offset like a centred short row. */
+    HWMOverviewRect cards[5]={{0,0,100,80},{120,0,100,80},{240,0,100,80},{60,100,100,80},{180,100,100,80}};
+    bool only_last[5]={false,false,false,false,true};
+    assert(hwm_overview_neighbor(cards,5,0,1,0,NULL)==1);
+    assert(hwm_overview_neighbor(cards,5,1,-1,0,NULL)==0);
+    assert(hwm_overview_neighbor(cards,5,2,1,0,NULL)==5);   /* nothing further right */
+    assert(hwm_overview_neighbor(cards,5,0,0,1,NULL)==3);   /* down goes down, not to the next index */
+    assert(hwm_overview_neighbor(cards,5,2,0,1,NULL)==4);
+    assert(hwm_overview_neighbor(cards,5,4,0,-1,NULL)==2 || hwm_overview_neighbor(cards,5,4,0,-1,NULL)==1);
+    assert(hwm_overview_neighbor(cards,5,0,1,0,only_last)==4); /* filtered cards are skipped */
+    assert(hwm_overview_neighbor(cards,5,9,1,0,NULL)==5 && hwm_overview_neighbor(NULL,5,0,1,0,NULL)==5);
+    HWMOverviewRect grown=hwm_overview_inflate(cards[1],1.1);
+    assert(fabs(grown.width-110)<1e-9 && fabs(grown.x-115)<1e-9 && fabs(grown.y+4)<1e-9);
+}
+
 int main(void)
 {
+    check_neighbors();
     HWMOverviewRect card;
     check_grid(1U);
     check_grid(7U);
     check_grid(20U);
     check_grid(50U);
+    check_grouped_grid();
     HWMOverviewRect portrait = {0,0,500,1000};
     HWMOverviewRect cell = {20,30,400,300};
     HWMOverviewRect fit = hwm_overview_fit(portrait,cell);

@@ -70,6 +70,45 @@ static inline bool hwm_overview_grid(HWMOverviewRect bounds, size_t count, doubl
     return true;
 }
 
+/*
+ * Arrange consecutive column groups as vertical overview columns. `groups` is
+ * one stable, arbitrary column identifier per item, and items in each group
+ * must already be in their desired top-to-bottom order. Group placement follows
+ * first appearance; a repeated identifier after another group is malformed and
+ * falls back to the ordinary balanced grid.
+ */
+static inline bool hwm_overview_grouped_grid(HWMOverviewRect bounds, size_t count,
+                                            const size_t *groups, double inset,
+                                            double gap, HWMOverviewRect *out)
+{
+    size_t group_count = 0U;
+    if (!groups || count == 0U || !out || !hwm_overview_finite_rect(bounds) ||
+        !isfinite(inset) || !isfinite(gap) || inset < 0.0 || gap < 0.0)
+        return hwm_overview_grid(bounds, count, inset, gap, out);
+    for (size_t index=0; index<count;) {
+        size_t end=index+1;
+        while(end<count && groups[end]==groups[index]) ++end;
+        for(size_t later=end;later<count;later++) if(groups[later]==groups[index])
+            return hwm_overview_grid(bounds,count,inset,gap,out);
+        ++group_count; index=end;
+    }
+    // Pack column groups into balanced cells, then expand backward in place.
+    // Backward expansion cannot overwrite a group cell still waiting to expand.
+    if(!hwm_overview_grid(bounds,group_count,inset,gap,out)) return false;
+    size_t end=count;
+    for(size_t group=group_count;group>0;group--) {
+        size_t start=end-1;
+        while(start>0 && groups[start-1]==groups[end-1]) --start;
+        HWMOverviewRect cell=out[group-1];
+        size_t rows=end-start;
+        double row_gap=fmin(gap,cell.height/(rows*3));
+        double height=(cell.height-row_gap*(rows-1))/rows;
+        for(size_t i=start;i<end;i++) out[i]=(HWMOverviewRect){cell.x,cell.y+(i-start)*(height+row_gap),cell.width,height};
+        end=start;
+    }
+    return true;
+}
+
 /* Preserve window proportions, including portrait and very wide windows. */
 static inline HWMOverviewRect hwm_overview_fit(HWMOverviewRect source, HWMOverviewRect cell)
 {
@@ -87,6 +126,36 @@ static inline HWMOverviewRect hwm_overview_flight(HWMOverviewRect a, HWMOverview
     double lift=4*p*(1-p)*fmin(100,screen_height*.10);
     return (HWMOverviewRect){a.x+(b.x-a.x)*p, a.y+(b.y-a.y)*p-lift,
                              a.width+(b.width-a.width)*p, a.height+(b.height-a.height)*p};
+}
+
+/*
+ * Arrow-key navigation over cards as they are laid out on screen. Returns the
+ * index of the nearest eligible card whose centre lies in direction (dx, dy),
+ * or `count` when there is none. `eligible` may be NULL (all cards).
+ */
+static inline size_t hwm_overview_neighbor(const HWMOverviewRect *cards, size_t count, size_t current,
+                                           int dx, int dy, const bool *eligible)
+{
+    size_t best=count; double best_score=INFINITY;
+    if(!cards || current>=count || (!dx && !dy)) return count;
+    double cx=cards[current].x+cards[current].width*.5, cy=cards[current].y+cards[current].height*.5;
+    for(size_t i=0;i<count;i++) {
+        if(i==current || (eligible && !eligible[i])) continue;
+        double x=cards[i].x+cards[i].width*.5-cx, y=cards[i].y+cards[i].height*.5-cy;
+        double along=dx ? x*dx : y*dy, across=dx ? fabs(y) : fabs(x);
+        if(along<=1.0) continue;
+        /* Prefer the same row/column: sideways distance costs double. */
+        double score=along+across*2.0;
+        if(score<best_score) { best_score=score; best=i; }
+    }
+    return best;
+}
+
+/* Scale a rect about its centre. */
+static inline HWMOverviewRect hwm_overview_inflate(HWMOverviewRect r, double scale)
+{
+    double w=r.width*scale, h=r.height*scale;
+    return (HWMOverviewRect){r.x+(r.width-w)*.5, r.y+(r.height-h)*.5, w, h};
 }
 
 static inline bool hwm_overview_rects_overlap(HWMOverviewRect a, HWMOverviewRect b)

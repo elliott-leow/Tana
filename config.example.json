@@ -1,0 +1,110 @@
+{
+  "settings": {
+    "motionStrength": 1,
+    "autofocus": "pointer-movement",
+    "showStripMap": false,
+    "stripWidths": [
+      0.333333,
+      0.5,
+      0.666667,
+      1
+    ],
+    "mod": "ctrl+alt",
+    "snap": "center",
+    "snapMagnet": 0.1,
+    "newWindowPlacement": "center-gap",
+    "hotReload": true,
+    "hud": true,
+    "inactiveOpacity": 1,
+    "gaps": {
+      "inner": 12,
+      "top": 14,
+      "bottom": 12,
+      "left": 12,
+      "right": 12
+    },
+    "border": {
+      "enabled": true,
+      "width": 2,
+      "radius": 12,
+      "active": "#66b8ff",
+      "activeEnd": "#b48cff",
+      "inactive": "#ffffff24"
+    },
+    "animations": {
+      "windows": {
+        "duration": 0.36,
+        "bounce": 0
+      },
+      "scroll": {
+        "speed": 22
+      },
+      "overview": {
+        "duration": 0.34
+      },
+      "open": true,
+      "close": true
+    },
+    "overview": {
+      "dim": 0.38
+    },
+    "commands": {
+      "terminal": "open -na Ghostty",
+      "browser": "open -a Firefox"
+    },
+    "snapThreshold": 0.15,
+    "swipeGain": 1,
+    "focusAfterScroll": "pointer"
+  },
+  "shortcuts": {
+    "left": "mod+left",
+    "right": "mod+right",
+    "move-left": "mod+shift+left",
+    "move-right": "mod+shift+right",
+    "float": "mod+f",
+    "full": "mod+return",
+    "center": "mod+c",
+    "home": "mod+h",
+    "pause": "mod+p",
+    "reflow": "mod+r",
+    "close": "mod+w",
+    "terminal": "mod+t",
+    "browser": "mod+b",
+    "overview": "mod+o",
+    "preset-width": "mod+1",
+    "fit-two": "mod+2",
+    "previous": "mod+tab",
+    "undo": "mod+z",
+    "consume": "mod+u",
+    "expel": "mod+e",
+    "up": "mod+up",
+    "down": "mod+down",
+    "utility-mark": "mod+m",
+    "utility": "mod+space",
+    "tabs": "mod+shift+t",
+    "reload-config": "mod+shift+r",
+    "commands": "mod+shift+p",
+    "move-first": "mod+shift+,",
+    "move-last": "mod+shift+."
+  },
+  "appRules": {
+    "com.apple.Safari": {
+      "width": 0.666667,
+      "floating": false,
+      "openBesideCurrent": true
+    },
+    "com.apple.Notes": {
+      "width": 760,
+      "floating": false,
+      "openBesideCurrent": true
+    },
+    "com.apple.Calculator": {
+      "width": 420,
+      "floating": true,
+      "openBesideCurrent": false
+    }
+  },
+  "exec": {
+    "mod+shift+f": "open -a Finder"
+  }
+}

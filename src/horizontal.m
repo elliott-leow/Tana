@@ -1,8 +1,11 @@
 /* Tana. MIT license; see LICENSE. */
 #include <math.h>
+#include <stdatomic.h>
 #include "strip_geometry.h"
 #include "strip_columns.h"
 #include "window_overview.m"
+#include "tana_config.m"
+#include "strip_workflow.h"
 
 extern struct window_manager g_window_manager;
 extern struct space_manager g_space_manager;
@@ -31,7 +34,39 @@ static bool hwm_reconcile_pending;
 static bool hwm_swiping; // Only accessed by the main-thread event tap.
 static uint64_t hwm_swipe_time;
 static bool hwm_keys[128];
-static double hwm_duration = 0.24;
+static bool hwm_tab_click;
+static double hwm_duration = 0.36; // Settle horizon of the tile springs.
+static double hwm_scroll_omega = 22;
+static double hwm_rubber; // Signed overscroll shown while a finger holds the strip past an end.
+static int hwm_snap = 2; // 0 free, 1 column edges, 2 centre the nearest column
+static double hwm_magnet = .1; // Pull toward a centred column while the strip is held.
+static double hwm_snap_threshold = .15; // Share of the way to the next column that commits a swipe to it.
+static double hwm_swipe_gain = 1; // Strip travel per unit of finger travel.
+static double hwm_snap_origin; // Where the strip rested when the current swipe began.
+static int hwm_focus_follow = 2; // After the strip is moved: 0 leave focus, 1 focus the window brought to the centre, 2 the one under the pointer.
+static void hwm_focus_follow_to(struct view *view,double offset);
+static bool hwm_settle_pending; // A wheel pan has no release event; settle when it goes quiet.
+static int hwm_new_placement; // 0 centre gap, 1 beside focused, 2 strip end
+static uint32_t hwm_nav_window; // Keyboard navigation cursor; leads the reported focus.
+static double hwm_nav_time;
+static bool hwm_nav_pending;
+static void hwm_nav_flush(void);
+static void hwm_preview_show(CGRect target,CGRect start,bool animate);
+static bool hwm_move_column(struct view *view,struct window *window,int mode);
+static bool hwm_place(struct view *view,uint32_t source,uint32_t target,HStripPlacement placement,bool commit,CGRect *preview);
+static double hwm_snap_target(struct view *view,double desired,double viewport,bool swipe);
+static NSString *hwm_terminal_command, *hwm_browser_command;
+static double hwm_config_mtime;
+static void hwm_config_poll(void);
+static void hwm_alpha_sync(bool restore);
+static _Atomic double hwm_motion_scale=1;
+static double hwm_scroll_initial_velocity,hwm_scroll_current_velocity;
+static bool hwm_release_velocity;
+static void hwm_feedback_navigation(bool wall);
+static void hwm_feedback_focus(struct window *previous,struct window *next);
+static void hwm_feedback_tick(struct view *view,double now);
+static void hwm_feedback_hide(void);
+static _Atomic bool hwm_pointer_focus=true;
 static uint64_t hwm_frames, hwm_slow_frames, hwm_move_failures, hwm_resize_operations;
 static _Atomic uint64_t hwm_key_actions;
 static double hwm_max_frame_ms;
@@ -39,6 +74,19 @@ static double hwm_last_input;
 static uint32_t hwm_resize_window;
 static uint32_t hwm_drag_window, hwm_drop_target;
 static HStripPlacement hwm_drop_placement;
+static CGPoint hwm_drag_point;
+static double hwm_drag_tick_time;
+static bool hwm_drag_cancelled,hwm_drag_shadow;
+/* Worst time per tick section since the last `profile-reset`, in ms. */
+enum { HWM_PROF_DRAG, HWM_PROF_RENDER, HWM_PROF_EXTRAS, HWM_PROF_PREVIEW, HWM_PROF_FEEDBACK, HWM_PROF_TICK_DRAGGING, HWM_PROF_COUNT };
+static double hwm_prof[HWM_PROF_COUNT];
+static uint64_t hwm_prof_drag_ticks, hwm_prof_drag_events;
+static double hwm_now(void);
+static double hwm_prof_mark(int slot,double since) { double t=hwm_now(), ms=(t-since)*1000; if(ms>hwm_prof[slot]) hwm_prof[slot]=ms; return t; }
+static CGPoint hwm_drag_move;
+static bool hwm_drag_move_pending;
+static void hwm_drag_autoscroll(struct view *view,double now);
+static void hwm_cancel_drag(void);
 static double hwm_focus_guard_time;
 static CGPoint hwm_focus_guard_point;
 static bool hwm_focus_guard;
@@ -68,12 +116,42 @@ static void hwm_save_state(void);
 static void hwm_load_state(void);
 static bool hwm_state_pending;
 static bool hwm_resume_load_state;
+static void hwm_hold_focus(void);
+static void hwm_undo_capture(void);
+static bool hwm_undo_restore(void);
+static bool hwm_named_action(const char *name);
+static TanaConfig *hwm_config;
+static NSArray *hwm_width_presets(void);
+static bool hwm_config_reload(bool announce);
+static bool hwm_hot_reload=true;
+static NSArray *hwm_config_problems;
+static double hwm_overview_duration=.34, hwm_overview_dim=.38;
+static void hwm_spawn(NSString *command);
+static void hwm_apply_app_rule(struct window *window);
+static void hwm_apply_app_rule_now(struct window *window);
+static void hwm_config_begin(void);
+static void hwm_menu_refresh_bindings(void);
 
 enum hwm_action { HWM_EVENT, HWM_LEFT, HWM_RIGHT, HWM_MOVE_LEFT, HWM_MOVE_RIGHT,
                   HWM_FLOAT, HWM_FULL, HWM_CENTER, HWM_HOME, HWM_PAUSE, HWM_REFLOW, HWM_QUIT, HWM_CLOSE, HWM_TERMINAL, HWM_BROWSER,
-                  HWM_OVERVIEW, HWM_OVERVIEW_GESTURE, HWM_OVERVIEW_CANCEL, HWM_OVERVIEW_POINTER };
+                  HWM_MOVE_FIRST, HWM_MOVE_LAST, HWM_OVERVIEW_FILTER, HWM_OVERVIEW_DRAG, HWM_OVERVIEW_HIGHLIGHT, HWM_OVERVIEW, HWM_OVERVIEW_GESTURE, HWM_OVERVIEW_CANCEL, HWM_OVERVIEW_POINTER, HWM_OVERVIEW_KEY, HWM_CANCEL_DRAG, HWM_NAMED_ACTION, HWM_APPLY_RULE, HWM_TAB_SELECT };
 
 static double hwm_now(void) { return (double) read_os_timer() / (double) read_os_freq(); }
+/* Animations are sampled for the moment the frame will be on screen, not for
+ * whenever this thread happened to wake. The display link supplies that
+ * moment; sampling at it gives evenly spaced motion however late a tick runs. */
+static uint64_t hwm_vsync_host;
+static double hwm_presented; // The time the last frame was sampled for.
+static double hwm_frame_time(double now)
+{
+    static mach_timebase_info_data_t base;
+    if(!base.denom) mach_timebase_info(&base);
+    double target=(double)__atomic_load_n(&hwm_vsync_host,__ATOMIC_RELAXED)*base.numer/base.denom/1e9;
+    return target>now && target-now<.05 ? target : now;
+}
+/* "Now" for anything that restarts an animation: never earlier than the frame
+ * already shown, or the restart would step backwards in time. */
+static double hwm_clock(void) { double now=hwm_now(); return now>hwm_presented ? now : hwm_presented; }
 static double horizontal_ease(double t)
 {
     return hstrip_ease(t);
@@ -85,36 +163,71 @@ static struct view *hwm_view(void)
     if (!hwm_space) return NULL;
     return space_manager_find_view(&g_space_manager, hwm_space);
 }
+/* The usable screen rectangle takes half a dozen WindowServer and Dock round
+ * trips to work out, and it is wanted many times in every frame. It changes
+ * only when the Dock, menu bar or display does, so it is remembered briefly. */
+static CGRect hwm_screen(struct view *view)
+{
+    static uint64_t sid; static double stamp=-10; static CGRect frame;
+    double now=hwm_now();
+    if(view->sid!=sid || now-stamp>.5) { sid=view->sid; stamp=now; frame=display_bounds_constrained(space_display_id(view->sid), false); }
+    return frame;
+}
 static CGRect hwm_bounds(struct view *view)
 {
-    CGRect frame = display_bounds_constrained(space_display_id(view->sid), false);
+    CGRect frame = hwm_screen(view);
     frame.origin.x += view->left_padding;
     frame.origin.y += view->top_padding;
     frame.size.width = fmax(100, frame.size.width-view->left_padding-view->right_padding);
     frame.size.height = fmax(100, frame.size.height-view->top_padding-view->bottom_padding);
     return frame;
 }
+static double hwm_content_width;
+static double hwm_max_offset(void) { return hwm_content_width>0 ? hwm_content_width : INFINITY; }
+static double hwm_clamp_offset(double offset)
+{
+    return fmin(hwm_max_offset(),hstrip_viewport_offset(offset));
+}
+/* The displayed camera position. It may lie slightly past either end: a finger
+ * holding the strip there is resisted, and a fling into an end bounces off it.
+ * view->strip_offset is always the clamped, in-bounds value. */
 static double hwm_offset(struct view *view, double now)
 {
-    if (!view->strip_scrolling) return view->strip_offset;
-    double t = (now - view->strip_scroll_start) / hwm_duration;
-    view->strip_offset = view->strip_from_offset + (view->strip_target_offset-view->strip_from_offset)*horizontal_ease(t);
-    if (t >= 1) view->strip_scrolling = false;
-    return view->strip_offset;
+    if (!view->strip_scrolling) return view->strip_offset+hwm_rubber;
+    double elapsed=now-view->strip_scroll_start;
+    double value=hstrip_spring(view->strip_from_offset,view->strip_target_offset,hwm_scroll_initial_velocity,
+                              elapsed,hwm_scroll_omega/fmax(.15,hwm_motion_scale),&hwm_scroll_current_velocity);
+    view->strip_offset=hwm_clamp_offset(value);
+    if(hwm_motion_scale==0 || (fabs(value-view->strip_target_offset)<.25 && fabs(hwm_scroll_current_velocity)<3) || elapsed>1.2) {
+        view->strip_offset=view->strip_target_offset; view->strip_scrolling=false; hwm_scroll_current_velocity=0;
+        return view->strip_offset;
+    }
+    return value;
 }
 static void hwm_scroll(struct view *view, double target, bool animate)
 {
     if (!view || !isfinite(target)) return;
     hwm_state_pending = true;
-    double now = hwm_now();
+    double now = hwm_clock();
+    double release=hwm_scroll_current_velocity;
     view->strip_from_offset = hwm_offset(view, now);
-    view->strip_target_offset = hstrip_viewport_offset(target);
+    hwm_rubber=0;
+    hwm_scroll_initial_velocity=hwm_release_velocity?release:hwm_scroll_current_velocity;
+    hwm_release_velocity=false;
+    hwm_feedback_navigation(target<0 || target>hwm_max_offset());
+    view->strip_target_offset = hwm_clamp_offset(target);
     view->strip_scroll_start = now;
     view->strip_scrolling = animate && fabs(view->strip_target_offset-view->strip_from_offset) > .25;
-    if (!view->strip_scrolling) view->strip_offset = view->strip_target_offset;
+    if (!view->strip_scrolling) { view->strip_offset = view->strip_target_offset; hwm_scroll_current_velocity=0; }
     hwm_wake();
 }
 
+#include "strip_ax_async.m"
+#include "strip_hud.m"
+static void hwm_resize_submit(struct window *w,CGRect frame,bool full) { (void)full; hwm_ax_resize(w->id,w->ref,w->application->ref,frame.size); }
+static bool hwm_resize_busy(struct window *w) { return hwm_ax_resize_busy(w->id); }
+static void hwm_close_submit(struct window *w) { horizontal_removing(w,false); hwm_ax_close(w->ref); }
+static bool hwm_window_left_strip(struct window *w) { return hwm_space && window_space(w->id)!=hwm_space; }
 #include "strip_layout.m"
 static void hwm_column_width(struct view *view,struct window *window,double width)
 {
@@ -139,6 +252,20 @@ static bool horizontal_flush_node(struct window_node *node)
     return false;
 }
 
+static void hwm_drag_started(struct window *window)
+{
+    if(hwm_drag_window) return;
+    hwm_undo_capture(); hwm_drag_shadow=window_check_flag(window,WINDOW_SHADOW);
+    scripting_addition_set_shadow(window->id,true);
+    hwm_drag_window=window->id;
+    SLSGetCurrentCursorLocation(g_connection,&hwm_drag_point);
+    hwm_drag_tick_time=hwm_now();
+    scripting_addition_set_layer(window->id,LAYER_NORMAL);
+}
+
+static uint32_t hwm_edge_window;
+#include "strip_feedback.m"
+#include "strip_interaction.m"
 #include "strip_renderer.m"
 #include "window_transitions.m"
 static void horizontal_tick(void)
@@ -162,10 +289,39 @@ static void horizontal_tick(void)
         __atomic_store_n(&__pending_gesture,false,__ATOMIC_RELEASE);
         hwm_focus_after_scroll = true;
     }
-    bool active = hwm_render(view, start);
-    active |= hwm_render_floating(start);
-    active |= hwm_render_closing(start);
-    active |= hwm_preview_render(start);
+    // Applied once the keys or fingers rest; a swipe still in progress may yet go further.
+    if(hwm_nav_pending && start-hwm_nav_time>.07 && !__atomic_load_n(&__pending_gesture,__ATOMIC_RELAXED)) hwm_nav_flush();
+    // A wheel pan that has been quiet for 90 ms is taken as "this is where I want to be".
+    if(hwm_settle_pending && start-hwm_last_input>.09) {
+        hwm_settle_pending=false;
+        if(!hwm_drag_window && !__atomic_load_n(&__pending_gesture,__ATOMIC_RELAXED)) {
+            hwm_scroll(view,hwm_snap_target(view,view->strip_offset,hwm_bounds(view).size.width,false),true);
+            hwm_focus_follow_to(view,view->strip_target_offset);
+        }
+    }
+    // Content can shrink under a parked camera; glide back inside the strip.
+    if(!view->strip_scrolling && !__atomic_load_n(&__pending_gesture,__ATOMIC_RELAXED) &&
+       (view->strip_offset>hwm_max_offset()+.5 || hwm_rubber)) hwm_scroll(view,fmin(view->strip_offset,hwm_max_offset()),true);
+    bool dragging=hwm_drag_window!=0;
+    double mark=hwm_now(), frame=hwm_frame_time(start);
+    hwm_presented=frame;
+    // Everything this frame changes is presented together.
+    hwm_batch_hold=true;
+    hwm_scale_reset_all();
+    hwm_drag_autoscroll(view,start);
+    struct window *edge=window_manager_find_window(&g_window_manager,hwm_edge_window);
+    if(edge) hwm_edge_update(edge,view);
+    mark=hwm_prof_mark(HWM_PROF_DRAG,mark);
+    bool active = hwm_render(view, frame) || edge!=NULL || hwm_drag_window!=0;
+    mark=hwm_prof_mark(HWM_PROF_RENDER,mark);
+    active |= hwm_render_floating(frame);
+    active |= hwm_render_closing(frame);
+    active |= hwm_render_pops(frame);
+    mark=hwm_prof_mark(HWM_PROF_EXTRAS,mark);
+    active |= hwm_preview_render(frame);
+    hwm_batch_release();
+    mark=hwm_prof_mark(HWM_PROF_PREVIEW,mark);
+    active |= hwm_nav_pending || hwm_settle_pending;
     if(hwm_close_source && start-hwm_close_time>1.0) { hwm_close_source=0; hwm_close_target=0; }
     if (hwm_close_target && !hwm_close_source && start-hwm_close_time>.04) {
         struct window *target=window_manager_find_window(&g_window_manager,hwm_close_target);
@@ -176,11 +332,15 @@ static void horizontal_tick(void)
     }
     if(hwm_close_target) active=true;
     if (__atomic_load_n(&__pending_gesture,__ATOMIC_RELAXED)) active = true;
+    hwm_feedback_tick(view,start);
+    hwm_prof_mark(HWM_PROF_FEEDBACK,mark);
+    if(dragging) { ++hwm_prof_drag_ticks; hwm_prof_mark(HWM_PROF_TICK_DRAGGING,start); }
     if (!active && hwm_focus_after_scroll && hwm_backend_ok) {
         hwm_focus_after_scroll = false;
+        if(hwm_pointer_focus) { hwm_hold_focus(); }
         CGPoint cursor; SLSGetCurrentCursorLocation(g_connection,&cursor);
         struct window *target = window_manager_find_window_at_point(&g_window_manager,cursor);
-        if (target && window_manager_is_window_eligible(target)) {
+        if (!hwm_pointer_focus && !hwm_focus_follow && target && window_manager_is_window_eligible(target)) {
             hwm_last_input = start; // A partially visible hover must not snap the viewport.
             window_manager_focus_window_without_raise(&target->application->psn,target->id);
         }
@@ -195,7 +355,8 @@ static void horizontal_tick(void)
 
 static CVReturn hwm_display_tick(CVDisplayLinkRef link, const CVTimeStamp *now, const CVTimeStamp *out, CVOptionFlags inFlags, CVOptionFlags *outFlags, void *context)
 {
-    (void)link; (void)now; (void)out; (void)inFlags; (void)outFlags; (void)context;
+    (void)link; (void)now; (void)inFlags; (void)outFlags; (void)context;
+    if(out) __atomic_store_n(&hwm_vsync_host,out->hostTime,__ATOMIC_RELAXED);
     bool expected = false;
     if ((__atomic_load_n(&hwm_active, __ATOMIC_ACQUIRE) || hwm_stop_requested) &&
         __atomic_compare_exchange_n(&hwm_tick_pending, &expected, true, false, __ATOMIC_ACQ_REL, __ATOMIC_RELAXED)) {
@@ -233,8 +394,12 @@ static void horizontal_activated(struct application *application)
 static void horizontal_focused(struct window *window, struct view *view)
 {
     if (!hwm_ready || hwm_paused || hwm_overview_active) return;
+    hwm_workflow_note_explicit_focus(window,view);
     hwm_hold_focus();
     scripting_addition_set_layer(window->id,window_check_flag(window,WINDOW_FLOAT)?LAYER_ABOVE:LAYER_BELOW);
+    // Keyboard navigation has already aimed the camera at its cursor. Focus
+    // reports for windows it passed on the way must not pull the camera back.
+    if (hwm_nav_window && hwm_now()-hwm_nav_time<.6) return;
     if ((window->id==hwm_preserve_focus_window && hwm_now()<hwm_preserve_focus_until) || !view || view->layout!=VIEW_STRIP || hwm_close_target || hwm_drag_window ||
         __atomic_load_n(&__pending_gesture,__ATOMIC_RELAXED) || hwm_now()-hwm_last_input<.15) return;
     CGRect bounds=hwm_bounds(view);
@@ -246,6 +411,8 @@ static void horizontal_removing(struct window *window, bool whole_app)
 {
     if (!hwm_ready || hwm_paused || !window) return;
     if(hwm_drag_window==window->id) { hwm_drag_window=0; hwm_preview_hide(); }
+    if(hwm_nav_window==window->id) { hwm_nav_window=0; hwm_nav_pending=false; }
+    hwm_hole_note(window_manager_find_managed_window(&g_window_manager,window),window);
     if (whole_app && hwm_close_target) {
         struct window *anchor=window_manager_find_window(&g_window_manager,hwm_close_target);
         if(anchor && anchor->application!=window->application) return;
@@ -258,13 +425,14 @@ static void horizontal_removing(struct window *window, bool whole_app)
     struct window *best=NULL; double distance=INFINITY;
     for(struct window_node *n=window_node_find_first_leaf(view->root);n;n=window_node_find_next_leaf(n)) for(int i=0;i<n->window_count;i++) {
         struct window *w=window_manager_find_window(&g_window_manager,n->window_list[i]);
-        if(!w || w==window || (whole_app && w->application==window->application)) continue;
+        if(!w || w==window || w->strip_close_ghost || (whole_app && w->application==window->application)) continue;
         double d=fabs(w->strip_world_x-window->strip_world_x)+fabs(w->strip_world_y-window->strip_world_y)*.1;
         if(d<distance) { best=w; distance=d; }
     }
     if(best) {
         hwm_close_source=window->id; hwm_close_target=best->id; hwm_close_time=hwm_now();
-        hwm_close_screen_x=best->strip_world_x-(just_lost_focus?hwm_previous_focus_offset:hwm_offset(view,hwm_now()));
+        // The camera is already gliding to its resting place around a vacated window.
+        hwm_close_screen_x=best->strip_world_x-(window->strip_close_ghost?view->strip_target_offset:just_lost_focus?hwm_previous_focus_offset:hwm_offset(view,hwm_now()));
         hwm_hold_focus(); hwm_wake();
     }
 }
@@ -273,16 +441,173 @@ static struct window_node *hwm_focused_node(struct view *view)
 {
     return view ? view_find_window_node(view, g_window_manager.focused_window_id) : NULL;
 }
-static void hwm_reorder(struct view *view, struct window_node *a, struct window_node *b)
+static uint64_t hwm_column_of(struct window *w) { return w->strip_full_width ? ((uint64_t)w->id<<32)|w->id : (w->strip_column ? w->strip_column : w->id); }
+/* Camera offset that centres a tile; one wider than the viewport shows its left edge. */
+static double hwm_center_target(struct view *view,struct window *w)
 {
-    if (!a || !b || a == b) return;
-    window_node_swap_window_list(a,b);
-    hwm_layout(view,true);
+    double viewport=hwm_bounds(view).size.width;
+    return w->strip_width>=viewport ? w->strip_world_x : hstrip_center_offset(w->strip_world_x,w->strip_width,viewport);
+}
+/* The visible window of the column one step left (-1) or right (+1). */
+static struct window *hwm_neighbor_column(struct view *view,struct window *from,int direction)
+{
+    uint64_t own=hwm_column_of(from), found=0; bool seen=false;
+    struct window *result=NULL;
+    for(struct window_node *n=window_node_find_first_leaf(view->root);n;n=window_node_find_next_leaf(n)) for(int i=0;i<n->window_count;i++) {
+        struct window *w=window_manager_find_window(&g_window_manager,n->window_list[i]); if(!w || w->strip_close_ghost) continue;
+        uint64_t column=hwm_column_of(w);
+        if(column==own) { seen=true; if(direction<0) return result; continue; }
+        if(direction<0) {
+            // Remember the latest column to the left, preferring its shown tab / top row.
+            if(column!=found) { found=column; result=w; }
+            else if(hwm_workflow_tab_hidden(result) && !hwm_workflow_tab_hidden(w)) result=w;
+        } else if(seen) {
+            if(!found) { found=column; result=w; }
+            else if(column!=found) return result;
+            else if(hwm_workflow_tab_hidden(result) && !hwm_workflow_tab_hidden(w)) result=w;
+        }
+    }
+    return direction>0 ? result : NULL;
+}
+/* Keyboard navigation aims the camera and the border immediately and applies
+ * the real focus once the keys rest. Activating every window passed on the way
+ * is what made quick presses stutter. */
+static void hwm_nav_flush(void)
+{
+    if(!hwm_nav_pending) return;
+    hwm_nav_pending=false;
+    struct window *w=window_manager_find_window(&g_window_manager,hwm_nav_window);
+    if(!w) return;
+    hwm_preserve_focus_window=w->id; hwm_preserve_focus_until=hwm_now()+.6;
+    hwm_workflow_note_explicit_focus(w,hwm_view());
+    window_manager_focus_window_with_raise(&w->application->psn,w->id,w->ref);
+}
+static struct window *hwm_nav_base(struct view *view)
+{
+    if(!view) return window_manager_find_window(&g_window_manager,g_window_manager.focused_window_id);
+    struct window *w=hwm_nav_window && hwm_now()-hwm_nav_time<.6 ? window_manager_find_window(&g_window_manager,hwm_nav_window) : NULL;
+    if(w && view && view_find_window_node(view,w->id)) return w;
+    return window_manager_find_window(&g_window_manager,g_window_manager.focused_window_id);
+}
+/* The window a command should act on: the navigation cursor while it leads
+ * the reported focus, otherwise the focused window. */
+static struct window *hwm_action_window(void) { return hwm_nav_base(hwm_view()); }
+static void hwm_nav_to(struct view *view,struct window *target)
+{
+    double now=hwm_now();
+    hwm_nav_window=target->id; hwm_nav_time=now; hwm_nav_pending=true; hwm_last_input=now;
+    hwm_hold_focus();
+    hwm_scroll(view,hwm_center_target(view,target),true);
+    hwm_feedback_focus(NULL,target);
+}
+/* When the strip is moved under a still pointer, the window that ends up
+ * beneath it takes focus without the pointer having to move. Which window
+ * that will be is known the moment the camera is given its destination
+ * `offset`, so focus does not wait for the strip to arrive. (In centre mode
+ * the window brought to the middle of the screen is chosen instead.) Empty
+ * desktop under the pointer changes nothing. This reuses the navigation
+ * cursor: the border leads and activation follows once the gesture is over. */
+static void hwm_focus_follow_to(struct view *view,double offset)
+{
+    if(!hwm_focus_follow || !view || hwm_drag_window || hwm_overview_active) return;
+    CGRect bounds=hwm_bounds(view);
+    CGPoint pointer=CGPointMake(CGRectGetMidX(bounds),CGRectGetMidY(bounds));
+    if(hwm_focus_follow==2) {
+        if(SLSGetCurrentCursorLocation(g_connection,&pointer)!=kCGErrorSuccess) return;
+        // A floating window under the pointer stays in charge: it does not move with the strip.
+        bool covered=false;
+        table_for(struct window *f,g_window_manager.window, {
+            CGRect frame=CGRectNull;
+            if(!covered && f->is_root && window_check_flag(f,WINDOW_FLOAT) && !window_check_flag(f,WINDOW_MINIMIZE) && !f->application->is_hidden &&
+               window_manager_is_window_eligible(f) && SLSGetWindowBounds(g_connection,f->id,&frame)==kCGErrorSuccess && CGRectContainsPoint(frame,pointer)) covered=true;
+        })
+        if(covered) return;
+    }
+    double x=offset+pointer.x-bounds.origin.x, y=pointer.y-bounds.origin.y, gap=view->window_gap*.5;
+    struct window *target=NULL;
+    for(struct window_node *n=window_node_find_first_leaf(view->root);n && !target;n=window_node_find_next_leaf(n)) for(int i=0;i<n->window_count;i++) {
+        struct window *w=window_manager_find_window(&g_window_manager,n->window_list[i]);
+        if(!w || w->strip_close_ghost || !w->strip_initialized || hwm_workflow_tab_hidden(w)) continue;
+        // Half the gap on each side belongs to the nearer window, so the pointer is rarely over nothing.
+        if(x<w->strip_world_x-gap || x>w->strip_world_x+w->strip_width+gap) continue;
+        if(hwm_focus_follow==2 && (y<w->strip_world_y-gap || y>w->strip_world_y+w->strip_height+gap)) continue;
+        target=w; break;
+    }
+    struct window *current=hwm_action_window();
+    if(!target || target==current) return;
+    // In centre mode, staying within the focused column keeps the row already in use.
+    if(hwm_focus_follow==1 && current && view_find_window_node(view,current->id) && hwm_column_of(current)==hwm_column_of(target)) return;
+    hwm_nav_window=target->id; hwm_nav_time=hwm_now(); hwm_nav_pending=true;
+    hwm_hold_focus();
+    hwm_feedback_focus(NULL,target);
+}
+static void hwm_commit_order(struct view *view,HStripColumnItem *items,size_t count)
+{
+    struct window_node *slot=window_node_find_first_leaf(view->root);
+    for(size_t i=0;i<count && slot;i++) {
+        struct window_node *found=view_find_window_node(view,(uint32_t)items[i].id);
+        if(!found) continue;
+        if(found!=slot) window_node_swap_window_list(found,slot);
+        slot=window_node_find_next_leaf(slot);
+    }
+}
+/* Move the focused window's whole column: -1/+1 swap it with the neighbouring
+ * column, -2/+2 send it to the start or end of the strip. Stacks travel intact. */
+static bool hwm_move_column(struct view *view,struct window *window,int mode)
+{
+    CGRect bounds=hwm_bounds(view); HStripColumnItem *items=NULL;
+    size_t count=hwm_items(view,bounds,&items); if(!items) return false;
+    HStripColumnItem *mine=calloc(count?count:1,sizeof(*mine)),*rest=calloc(count?count:1,sizeof(*rest));
+    size_t mine_count=0,rest_count=0,position=0; uint64_t own=hwm_column_of(window); bool ok=mine && rest;
+    for(size_t i=0;ok && i<count;i++) {
+        if(hstrip_columns_key(&items[i])==own) { if(!mine_count) position=rest_count; mine[mine_count++]=items[i]; }
+        else rest[rest_count++]=items[i];
+    }
+    size_t insert=position;
+    if(ok && mine_count) {
+        if(mode==-2) insert=0;
+        else if(mode==2) insert=rest_count;
+        else if(mode<0 && position>0) {
+            uint64_t key=hstrip_columns_key(&rest[position-1]); insert=position-1;
+            while(insert>0 && hstrip_columns_key(&rest[insert-1])==key) --insert;
+        } else if(mode>0 && position<rest_count) {
+            uint64_t key=hstrip_columns_key(&rest[position]); insert=position+1;
+            while(insert<rest_count && hstrip_columns_key(&rest[insert])==key) ++insert;
+        }
+    }
+    ok=ok && mine_count && insert!=position;
+    if(ok) {
+        hwm_undo_capture();
+        memcpy(items,rest,insert*sizeof(*items));
+        memcpy(items+insert,mine,mine_count*sizeof(*items));
+        memcpy(items+insert+mine_count,rest+insert,(rest_count-insert)*sizeof(*items));
+        hwm_commit_order(view,items,count);
+        hwm_layout(view,true);
+        // Follow the window: it stays under the user's eyes while the strip rearranges.
+        hwm_scroll(view,hwm_center_target(view,window),true);
+        hwm_hold_focus();
+    }
+    free(items); free(mine); free(rest);
+    return ok;
+}
+static void hwm_spawn(NSString *command)
+{
+    if(!command.length) return;
+    hwm_hold_focus();
+    NSString *copy=[command copy];
+    dispatch_async(dispatch_get_main_queue(), ^{
+        NSTask *task=[[[NSTask alloc] init] autorelease]; task.launchPath=@"/bin/sh";
+        task.arguments=@[@"-c",copy];
+        NSError *error=nil;
+        if(![task launchAndReturnError:&error]) { warn("Tana: launch failed: %s\n",error.localizedDescription.UTF8String); hwm_hud([NSString stringWithFormat:@"Could not run: %@",copy]); }
+        [copy release];
+    });
 }
 #include "overview_runtime.m"
 
 static void hwm_action(int action)
 {
+    if(action==HWM_CANCEL_DRAG) { hwm_cancel_drag(); return; }
     if(action==HWM_OVERVIEW) {
         if(hwm_overview_active) horizontal_overview_select(0,0);
         else hwm_overview_begin(true);
@@ -290,21 +615,20 @@ static void hwm_action(int action)
     }
     if(action==HWM_OVERVIEW_CANCEL) { horizontal_overview_select(0,0); return; }
     if (action==HWM_TERMINAL || action==HWM_BROWSER) {
-        hwm_hold_focus();
-        dispatch_async(dispatch_get_main_queue(), ^{
-            NSTask *task=[[[NSTask alloc] init] autorelease]; task.launchPath=@"/usr/bin/open";
-            task.arguments= action==HWM_TERMINAL ? @[@"-na",@"Ghostty"] : @[@"-a",@"Firefox"];
-            NSError *error=nil; if(![task launchAndReturnError:&error]) warn("Tana: launch failed: %s\n",error.localizedDescription.UTF8String);
-        }); return;
+        hwm_spawn(action==HWM_TERMINAL ? (hwm_terminal_command ?: @"open -na Ghostty") : (hwm_browser_command ?: @"open -a Firefox"));
+        return;
     }
     if (action == HWM_QUIT) { hwm_shutdown(); return; }
     struct view *view = hwm_view();
-    struct window *window = window_manager_find_window(&g_window_manager, g_window_manager.focused_window_id);
-    struct window_node *node = hwm_focused_node(view);
+    struct window *window = hwm_action_window();
+    struct window_node *node = view && window ? view_find_window_node(view, window->id) : NULL;
     if (action == HWM_PAUSE) {
         horizontal_overview_done();
         hwm_cancel_closing();
+        hwm_cancel_pops();
         hwm_paused = !hwm_paused;
+        hwm_alpha_sync(hwm_paused);
+        hwm_hud(hwm_paused ? @"Tana paused" : @"Tana resumed");
         __atomic_store_n(&hwm_active,false,__ATOMIC_RELEASE);
         if (!hwm_paused) {
             table_for (struct window *w, g_window_manager.window, { w->strip_last_frame = CGRectNull; })
@@ -313,25 +637,39 @@ static void hwm_action(int action)
         return;
     }
     if (hwm_paused || !view) return;
-    if (action == HWM_HOME) { hwm_scroll(view,0,true); return; }
+    if (action == HWM_HOME) { hwm_scroll(view,0,true); hwm_focus_follow_to(view,0); return; }
     if (action == HWM_REFLOW) {
         table_for (struct window *w, g_window_manager.window, { w->strip_last_frame = CGRectNull; })
         hwm_layout(view,true); return;
     }
     if (!window) return;
     if(action==HWM_CLOSE) {
+        if(node && !window->strip_close_pending && !window->strip_close_ghost) {
+            // Give up the window's place now: its neighbours close in while it
+            // fades, instead of waiting for the application to finish closing.
+            hwm_hole_note(view,window);
+            window->strip_close_ghost=true; window->strip_ghost_time=hwm_now();
+            hwm_layout(view,true);
+        }
         hwm_close_animated(window); return;
     }
     if (action == HWM_FLOAT) {
         bool should_float = !window_check_flag(window, WINDOW_FLOAT);
         if (should_float) {
             CGRect bounds = hwm_bounds(view);
+            hwm_hole_note(view,window);
             window_manager_make_window_floating(&g_space_manager,&g_window_manager,window,true,true);
             double width = fmin(window->strip_width > 0 ? window->strip_width : 800,bounds.size.width*.8);
-            hwm_float_to(window,CGRectMake(bounds.origin.x+(bounds.size.width-width)/2,bounds.origin.y+bounds.size.height*.12,width,bounds.size.height*.76));
+            CGRect target=CGRectMake(bounds.origin.x+(bounds.size.width-width)/2,bounds.origin.y+bounds.size.height*.12,width,bounds.size.height*.76);
+            // A window that has floated before returns to where it floated.
+            CGRect saved=window->strip_float_saved;
+            if(saved.size.width>=200 && saved.size.height>=160 && CGRectIntersectsRect(saved,CGRectInset(bounds,40,40))) target=saved;
+            hwm_float_to(window,target);
             scripting_addition_set_layer(window->id,LAYER_ABOVE);
         } else {
-            window->strip_float_animating=false;
+            CGRect current=window->strip_float_animating ? window->strip_float_target : CGRectNull;
+            if(!CGRectIsNull(current) || SLSGetWindowBounds(g_connection,window->id,&current)==kCGErrorSuccess) window->strip_float_saved=current;
+            window->strip_float_animating=false; window->strip_float_full=false;
             window_manager_make_window_floating(&g_space_manager,&g_window_manager,window,false,true);
             hwm_layout(view,true);
             horizontal_focused(window,view);
@@ -361,17 +699,13 @@ static void hwm_action(int action)
     } else if (action == HWM_CENTER) {
         CGRect bounds = hwm_bounds(view);
         hwm_scroll(view,hstrip_center_offset(window->strip_world_x,window->strip_width,bounds.size.width),true);
-    } else if (action == HWM_LEFT || action == HWM_RIGHT || action == HWM_MOVE_LEFT || action == HWM_MOVE_RIGHT) {
-        bool left = action == HWM_LEFT || action == HWM_MOVE_LEFT;
-        struct window_node *next = left ? window_node_find_prev_leaf(node) : window_node_find_next_leaf(node);
-        if (!next) return;
-        if (action == HWM_MOVE_LEFT || action == HWM_MOVE_RIGHT) hwm_reorder(view,node,next);
-        else window = window_manager_find_window(&g_window_manager,next->window_list[0]);
-        if (window) {
-            hwm_last_input = 0;
-            horizontal_focused(window,view);
-            window_manager_focus_window_with_raise(&window->application->psn,window->id,window->ref);
-        }
+    } else if (action == HWM_LEFT || action == HWM_RIGHT) {
+        struct window *base=hwm_nav_base(view);
+        struct window *next=base && view_find_window_node(view,base->id) ? hwm_neighbor_column(view,base,action==HWM_LEFT?-1:1) : NULL;
+        if (next) hwm_nav_to(view,next);
+        else if (base && view_find_window_node(view,base->id)) { hwm_feedback_navigation(true); hwm_scroll(view,hwm_center_target(view,base),true); }
+    } else if (action == HWM_MOVE_LEFT || action == HWM_MOVE_RIGHT || action == HWM_MOVE_FIRST || action == HWM_MOVE_LAST) {
+        if(!hwm_move_column(view,window,action==HWM_MOVE_LEFT?-1:action==HWM_MOVE_RIGHT?1:action==HWM_MOVE_FIRST?-2:2)) hwm_feedback_navigation(true);
     }
 }
 
@@ -392,12 +726,16 @@ static bool horizontal_event(CGEventType type, CGEventRef event)
         if (code >= 0 && code < 128 && hwm_keys[code]) { hwm_keys[code] = false; return true; }
     }
     if (hwm_paused) return false;
+    if(hwm_tab_click && type==kCGEventLeftMouseUp) { hwm_tab_click=false; return true; }
+    if(!hwm_overview_active && type==kCGEventLeftMouseDown) {
+        NSDictionary *tab=[[TanaFeedback shared] tabAt:CGEventGetLocation(event)];
+        if(tab) { hwm_tab_click=true; event_loop_post(&g_event_loop,HORIZONTAL_INPUT,[tab retain],HWM_TAB_SELECT); return true; }
+    }
     if(hwm_overview_active && (type==kCGEventLeftMouseDown || type==kCGEventMouseMoved ||
        type==kCGEventLeftMouseDragged || type==kCGEventLeftMouseUp)) {
         // Fully transparent AppKit pixels are click-through. Route the global
         // pointer stream to the selector before ordinary app/drag handling.
-        if(type==kCGEventLeftMouseDown || type==kCGEventMouseMoved)
-            event_loop_post(&g_event_loop,HORIZONTAL_INPUT,(void *)CFRetain(event),HWM_OVERVIEW_POINTER);
+        event_loop_post(&g_event_loop,HORIZONTAL_INPUT,(void *)CFRetain(event),HWM_OVERVIEW_POINTER);
         return true;
     }
     if(type==30 && CGEventGetIntegerValueField(event,110)==23 && CGEventGetIntegerValueField(event,123)==2) {
@@ -415,37 +753,30 @@ static bool horizontal_event(CGEventType type, CGEventRef event)
     if(hwm_overview_active && type==kCGEventKeyDown) {
         int code=(int)CGEventGetIntegerValueField(event,kCGKeyboardEventKeycode);
         if(code>=0 && code<128) hwm_keys[code]=true;
-        if(code==53) event_loop_post(&g_event_loop,HORIZONTAL_INPUT,NULL,HWM_OVERVIEW_CANCEL);
+        event_loop_post(&g_event_loop,HORIZONTAL_INPUT,(void *)CFRetain(event),HWM_OVERVIEW_KEY);
         return true;
     }
     if (type == kCGEventKeyDown) {
         CGEventFlags flags = CGEventGetFlags(event);
         CGEventFlags modifiers=flags&(kCGEventFlagMaskCommand|kCGEventFlagMaskAlternate|kCGEventFlagMaskControl|kCGEventFlagMaskShift);
         int code=(int)CGEventGetIntegerValueField(event,kCGKeyboardEventKeycode);
-        bool shift=(flags&kCGEventFlagMaskShift)!=0;
-        int action=-1;
-        if(modifiers==kCGEventFlagMaskCommand) {
-            if(code==12) action=HWM_CLOSE;
-            if(code==36 || code==76) action=HWM_TERMINAL;
-            if(code==49) action=HWM_FLOAT;
-        } else if(modifiers==(kCGEventFlagMaskCommand|kCGEventFlagMaskShift)) {
-            if(code==13) action=HWM_BROWSER;
-            if(code==36 || code==76) action=HWM_FULL;
-        } else if((modifiers&~kCGEventFlagMaskShift)==(kCGEventFlagMaskCommand|kCGEventFlagMaskAlternate)) {
-            if(code==123) action=shift?HWM_MOVE_LEFT:HWM_LEFT;
-            if(code==124) action=shift?HWM_MOVE_RIGHT:HWM_RIGHT;
-            if(code==49) action=HWM_FLOAT;
-            if(code==3) action=HWM_FULL;
-            if(code==8) action=HWM_CENTER;
-            if(code==29) action=HWM_HOME;
+        if(code==53 && hwm_drag_window) {
+            hwm_keys[code]=true;
+            event_loop_post(&g_event_loop,HORIZONTAL_INPUT,NULL,HWM_CANCEL_DRAG); return true;
         }
-        if (action >= 0) {
-            if(CGEventGetIntegerValueField(event,kCGKeyboardEventAutorepeat) && action!=HWM_LEFT && action!=HWM_RIGHT && action!=HWM_MOVE_LEFT && action!=HWM_MOVE_RIGHT) return true;
-            ++hwm_key_actions;
-            hwm_keys[code] = true;
-            event_loop_post(&g_event_loop,HORIZONTAL_INPUT,NULL,action);
-            return true;
+        (void)modifiers;
+        TanaConfigSnapshot *snapshot=[hwm_config copySnapshot];
+        NSString *name=[snapshot actionForKeyCode:(unsigned short)code modifiers:(NSUInteger)flags];
+        // macOS tags physical arrow keys with Function even without an Fn chord.
+        if(!name && code>=123 && code<=126) name=[snapshot actionForKeyCode:(unsigned short)code modifiers:((NSUInteger)flags&~NSEventModifierFlagFunction)];
+        if(name) {
+            bool repeat=CGEventGetIntegerValueField(event,kCGKeyboardEventAutorepeat);
+            bool allow=[@[@"left",@"right",@"up",@"down",@"move-left",@"move-right",@"swap-left",@"swap-right"] containsObject:name];
+            if(!repeat || allow) event_loop_post(&g_event_loop,HORIZONTAL_INPUT,strdup(name.UTF8String),HWM_NAMED_ACTION);
+            ++hwm_key_actions; if(code>=0 && code<128) hwm_keys[code]=true;
+            [snapshot release]; return true;
         }
+        [snapshot release];
     }
     if (type == kCGEventScrollWheel && (CGEventGetFlags(event)&kCGEventFlagMaskAlternate)) {
         if (CGEventGetFlags(event)&(kCGEventFlagMaskCommand|kCGEventFlagMaskControl)) return false;
@@ -470,18 +801,98 @@ static bool horizontal_event(CGEventType type, CGEventRef event)
     return false;
 }
 
+/* Column extents in strip order; the caller frees both arrays. */
+static size_t hwm_columns(struct view *view,double **lefts_out,double **widths_out)
+{
+    size_t capacity=0,count=0;
+    for(struct window_node *n=window_node_find_first_leaf(view->root);n;n=window_node_find_next_leaf(n)) capacity+=n->window_count;
+    double *lefts=calloc(capacity?capacity:1,sizeof(double)),*widths=calloc(capacity?capacity:1,sizeof(double));
+    if(lefts && widths) for(struct window_node *n=window_node_find_first_leaf(view->root);n;n=window_node_find_next_leaf(n)) for(int i=0;i<n->window_count;i++) {
+        struct window *w=window_manager_find_window(&g_window_manager,n->window_list[i]);
+        if(!w || w->strip_close_ghost || !w->strip_initialized || (count && lefts[count-1]==w->strip_world_x)) continue;
+        lefts[count]=w->strip_world_x; widths[count++]=w->strip_width;
+    }
+    *lefts_out=lefts; *widths_out=widths;
+    return lefts && widths ? count : 0;
+}
+/* Where the strip should come to rest near `desired`: a column centred (or
+ * flush, in column mode). The decision is made the instant the fingers lift,
+ * from where the release velocity was already taking the strip. After a swipe
+ * it is directional: going a modest share of the way toward the next column
+ * commits to it, so changing window takes a short flick, not a long drag. */
+static double hwm_snap_target(struct view *view,double desired,double viewport,bool swipe)
+{
+    if(!hwm_snap) return desired;
+    double *lefts,*widths; size_t count=hwm_columns(view,&lefts,&widths);
+    double end=hwm_max_offset(), result=desired;
+    if(hwm_snap==2 && count) {
+        // Resting offsets in ascending order: each column centred, then the empty end.
+        double *rests=calloc(count+1,sizeof(double)); size_t n=0;
+        if(rests) {
+            for(size_t i=0;i<count;i++) {
+                double c=hstrip_snap_center(lefts[i]+widths[i]*.5-viewport*.5,viewport,lefts+i,widths+i,1);
+                if(!n || c>rests[n-1]+.5) rests[n++]=c;
+            }
+            if(isfinite(end) && end>rests[n-1]+.5) rests[n++]=end;
+            result=swipe ? hstrip_snap_directional(hwm_snap_origin,desired,rests,n,hwm_snap_threshold)
+                         : hstrip_snap_directional(desired,desired,rests,n,hwm_snap_threshold);
+            free(rests);
+        }
+    } else if(count) {
+        result=hstrip_snap_offset(desired,viewport,lefts,widths,count,viewport*.5);
+        // The empty desktop past the last window is a resting place too.
+        if(isfinite(end) && fabs(end-desired)<fabs(result-desired)) result=end;
+    }
+    free(lefts); free(widths);
+    return result;
+}
+/* While held, the strip leans weakly toward the nearest centred column. */
+static double hwm_magnetize(struct view *view,double raw,double viewport)
+{
+    if(hwm_snap!=2 || !(hwm_magnet>0) || hwm_motion_scale==0) return raw;
+    double *lefts,*widths; size_t count=hwm_columns(view,&lefts,&widths);
+    double rest=count ? hstrip_snap_center(raw,viewport,lefts,widths,count) : raw;
+    free(lefts); free(widths);
+    return hstrip_magnet(raw,rest,viewport*.16,hwm_magnet);
+}
+
 static void horizontal_input(void *context, int action)
 {
+    if(action==HWM_TAB_SELECT) {
+        NSDictionary *tab=context; struct window *w=window_manager_find_window(&g_window_manager,[tab[@"id"] unsignedIntValue]);
+        if(w && w->application->pid==[tab[@"pid"] intValue]) window_manager_focus_window_with_raise(&w->application->psn,w->id,w->ref);
+        [tab release]; return;
+    }
+    if(action==HWM_APPLY_RULE) { hwm_apply_app_rule_now(window_manager_find_window(&g_window_manager,(uint32_t)(uintptr_t)context)); return; }
+    if(action==HWM_NAMED_ACTION) { hwm_named_action(context); free(context); return; }
+    if(action==HWM_OVERVIEW_KEY) {
+        CGEventRef event=context; uint64_t generation=hwm_overview_generation;
+        dispatch_async(dispatch_get_main_queue(),^{
+            if(hwm_overview_active && generation==hwm_overview_generation)
+                [[HorizontalWindowOverview sharedOverview] keyEvent:[NSEvent eventWithCGEvent:event]];
+            CFRelease(event);
+        }); return;
+    }
+    if(action==HWM_OVERVIEW_HIGHLIGHT) { hwm_overview_highlight((uint32_t)(uintptr_t)context); return; }
+    if(action==HWM_OVERVIEW_FILTER) { NSArray *dimmed=context; hwm_overview_filter(dimmed); [dimmed release]; return; }
+    if(action==HWM_OVERVIEW_DRAG) {
+        NSArray *drag=context;
+        hwm_overview_drag([drag[0] unsignedIntValue],[drag[1] intValue],CGPointMake([drag[2] doubleValue],[drag[3] doubleValue]));
+        [drag release]; return;
+    }
     if(action==HWM_OVERVIEW_POINTER) {
         CGEventRef event=context;
         CGPoint point=CGEventGetLocation(event);
-        bool click=CGEventGetType(event)==kCGEventLeftMouseDown;
+        CGEventType kind=CGEventGetType(event);
         uint64_t generation=hwm_overview_generation;
         NSPoint local=NSMakePoint(point.x-hwm_overview_screen.origin.x,point.y-hwm_overview_screen.origin.y);
         dispatch_async(dispatch_get_main_queue(), ^{
             if(hwm_overview_active && generation==hwm_overview_generation) {
-                if(click) [[HorizontalWindowOverview sharedOverview] clickAt:local];
-                else [[HorizontalWindowOverview sharedOverview] mouseAt:local];
+                HorizontalWindowOverview *overview=[HorizontalWindowOverview sharedOverview];
+                if(kind==kCGEventLeftMouseDown) [overview pressAt:local];
+                else if(kind==kCGEventLeftMouseDragged) [overview dragAt:local];
+                else if(kind==kCGEventLeftMouseUp) [overview releaseAt:local];
+                else [overview mouseAt:local];
             }
         });
         CFRelease(event); return;
@@ -497,8 +908,9 @@ static void horizontal_input(void *context, int action)
         double dy = CGEventGetDoubleValueField(event,kCGScrollWheelEventPointDeltaAxis1);
         if (CGEventGetFlags(event)&kCGEventFlagMaskShift) {
             hwm_scroll(view,view->strip_offset+(fabs(dx)>fabs(dy)?dx:dy),false);
+            hwm_settle_pending=true;
         } else {
-            if (now-hwm_last_input > .25 || !hwm_resize_window) hwm_resize_window = g_window_manager.focused_window_id;
+            if (now-hwm_last_input > .25 || !hwm_resize_window) { hwm_undo_capture(); hwm_resize_window = g_window_manager.focused_window_id; }
             struct window *window = window_manager_find_window(&g_window_manager,hwm_resize_window);
             if (window && isfinite(dx) && isfinite(dy)) {
                 if (window_manager_find_managed_window(&g_window_manager,window)) {
@@ -519,7 +931,9 @@ static void horizontal_input(void *context, int action)
         double progress = CGEventGetDoubleValueField(event,124);
         if (!isfinite(progress) || fabs(progress) > 20) { CFRelease(event); return; }
         double width = hwm_bounds(view).size.width;
+        progress*=hwm_swipe_gain;
         if (phase == 1) {
+            hwm_snap_origin = view->strip_target_offset;
             view->strip_gesture_origin = hwm_offset(view,now);
             view->strip_scrolling = false;
             view->strip_velocity = 0;
@@ -533,13 +947,21 @@ static void horizontal_input(void *context, int action)
                 double velocity = (progress-view->strip_last_progress)*width/dt;
                 view->strip_velocity = view->strip_velocity*.65+velocity*.35;
             }
-            hwm_scroll(view,view->strip_gesture_origin+progress*width,false);
+            double raw=view->strip_gesture_origin+progress*width, limit=hwm_max_offset();
+            hwm_scroll(view,raw<0 || raw>limit ? raw : hwm_magnetize(view,raw,width),false);
+            // Past either end the strip keeps following the finger, with growing resistance.
+            hwm_rubber=hwm_motion_scale==0 ? 0 : raw<0 ? -hstrip_rubber_band(-raw,width*.3) : raw>limit ? hstrip_rubber_band(raw-limit,width*.3) : 0;
             view->strip_last_progress = progress;
             view->strip_last_time = now;
         } else if (phase == 4 || phase == 8) {
-            double velocity = now-view->strip_last_time < .1 ? view->strip_velocity : 0;
-            double coast = phase == 8 ? 0 : fmax(-width*.65,fmin(width*.65,velocity*.16));
-            hwm_scroll(view,view->strip_offset+coast,true);
+            double velocity = now-view->strip_last_time < .1 && !hwm_rubber ? view->strip_velocity : 0;
+            double coast = phase == 8 ? 0 : fmax(-width*.65,fmin(width*.65,velocity/hwm_scroll_omega));
+            double target=view->strip_offset+coast;
+            if(phase==4) target=hwm_snap_target(view,target,width,true);
+            hwm_scroll_current_velocity=phase==8?0:velocity; hwm_release_velocity=true;
+            hwm_scroll(view,target,true);
+            // Focus goes where the strip is going, decided now rather than when it arrives.
+            if(phase==4) hwm_focus_follow_to(view,view->strip_target_offset);
             hwm_focus_after_scroll = true;
             __atomic_store_n(&__pending_gesture,false,__ATOMIC_RELEASE);
             __atomic_store_n(&__last_gesture_time,read_os_timer(),__ATOMIC_RELEASE);
@@ -568,7 +990,7 @@ static bool hwm_preview_render(double now)
     hwm_preview_alpha=hwm_preview_alpha_from+((hwm_preview_hiding?0:1)-hwm_preview_alpha_from)*horizontal_ease(fade);
     if(hwm_preview_hiding && fade>=1) { hwm_preview_hide_immediately(); return false; }
     if(hwm_preview_id) SLSSetWindowAlpha(g_connection,hwm_preview_id,hwm_preview_alpha);
-    double t=(now-hwm_preview_start)/hwm_duration,p=horizontal_ease(t);
+    double span=fmax(.001,.18*hwm_motion_scale), t=(now-hwm_preview_start)/span, p=hstrip_spring_progress(now-hwm_preview_start,span);
     CGRect a=hwm_preview_from,b=hwm_preview_target;
     CGRect f=CGRectMake(a.origin.x+(b.origin.x-a.origin.x)*p,a.origin.y+(b.origin.y-a.origin.y)*p,
                        a.size.width+(b.size.width-a.size.width)*p,a.size.height+(b.size.height-a.size.height)*p);
@@ -595,7 +1017,7 @@ static bool hwm_preview_render(double now)
     SLSDisableUpdate(g_connection);
     SLSSetWindowShape(g_connection,hwm_preview_id,0,0,region);
     CGContextClearRect(hwm_preview_context,local);
-    CGPathRef path=CGPathCreateWithRoundedRect(CGRectInset(local,2,2),12,12,NULL);
+    CGPathRef path=CGPathCreateWithRoundedRect(CGRectInset(local,local.size.width<=4?0:2,2),local.size.width<=4?2:12,local.size.width<=4?2:12,NULL);
     CGContextSetRGBFillColor(hwm_preview_context,.22,.55,1,.20);
     CGContextSetRGBStrokeColor(hwm_preview_context,.28,.63,1,.95);
     CGContextSetLineWidth(hwm_preview_context,2);
@@ -606,10 +1028,20 @@ static bool hwm_preview_render(double now)
     CGPathRelease(path); CFRelease(region);
     return active;
 }
-static void hwm_preview_set(CGRect target,CGRect start)
+/* `animate` glides to a new drop zone. Without it the box is pinned to a zone
+ * that is itself moving (edge autoscroll), which must not restart the glide. */
+static void hwm_preview_show(CGRect target,CGRect start,bool animate)
 {
     if(hwm_preview_visible && !hwm_preview_hiding && CGRectEqualToRect(target,hwm_preview_target)) return;
     double now=hwm_now();
+    if(hwm_preview_visible && !hwm_preview_hiding && !animate) {
+        // Carry the remaining glide along with the zone instead of restarting it.
+        double dx=target.origin.x-hwm_preview_target.origin.x, dy=target.origin.y-hwm_preview_target.origin.y;
+        hwm_preview_from=CGRectOffset(hwm_preview_from,dx,dy);
+        hwm_preview_from.size.width+=target.size.width-hwm_preview_target.size.width;
+        hwm_preview_from.size.height+=target.size.height-hwm_preview_target.size.height;
+        hwm_preview_target=target; hwm_wake(); return;
+    }
     if(hwm_preview_visible) hwm_preview_render(now);
     hwm_preview_alpha_from=hwm_preview_visible?hwm_preview_alpha:0;
     hwm_preview_alpha_start=now; hwm_preview_hiding=false;
@@ -617,6 +1049,7 @@ static void hwm_preview_set(CGRect target,CGRect start)
     if(!hwm_preview_visible) hwm_preview_current=CGRectNull;
     hwm_preview_target=target; hwm_preview_start=now; hwm_preview_visible=true; hwm_wake();
 }
+static void hwm_preview_set(CGRect target,CGRect start) { hwm_preview_show(target,start,true); }
 static bool hwm_place(struct view *view,uint32_t source,uint32_t target,HStripPlacement placement,bool commit,CGRect *preview)
 {
     if(!view) return false;
@@ -648,31 +1081,51 @@ static bool hwm_place(struct view *view,uint32_t source,uint32_t target,HStripPl
     }
     free(items); return valid;
 }
+#include "strip_workflow.m"
+
+/* Choose the drop zone under the pointer and show where the window will land.
+ * Neighbours stay where they are until the drop: rearranging live windows
+ * mid-drag costs Accessibility resizes and moves the very rectangles the
+ * pointer is being tested against, which makes the choice oscillate. */
 static void hwm_drag_update(struct view *view,struct window *window,CGPoint point)
 {
-    CGRect bounds=hwm_bounds(view),actual=window->frame;
-    SLSGetWindowBounds(g_connection,window->id,&actual);
+    CGRect bounds=hwm_bounds(view); double offset=hwm_offset(view,hwm_now());
     struct window *target=NULL; HStripPlacement placement=HSTRIP_AFTER_COLUMN;
-    double nearest=INFINITY;
+    CGRect zone=CGRectNull; double nearest=INFINITY;
     for(struct window_node *n=window_node_find_first_leaf(view->root);n;n=window_node_find_next_leaf(n)) for(int i=0;i<n->window_count;i++) {
         struct window *w=window_manager_find_window(&g_window_manager,n->window_list[i]);
-        if(!w || w==window) continue;
-        CGRect f=CGRectMake(bounds.origin.x+w->strip_world_x-view->strip_offset,bounds.origin.y+w->strip_world_y,w->strip_width,w->strip_height);
+        if(!w || w==window || hwm_workflow_tab_hidden(w)) continue;
+        CGRect f=CGRectMake(bounds.origin.x+w->strip_world_x-offset,bounds.origin.y+w->strip_world_y,w->strip_width,w->strip_height);
+        if(f.size.width<=0 || f.size.height<=0) continue;
         double dx=fmax(f.origin.x-point.x,fmax(0,point.x-CGRectGetMaxX(f)));
         double dy=fmax(f.origin.y-point.y,fmax(0,point.y-CGRectGetMaxY(f)));
         double distance=hypot(dx,dy);
         if(distance>=nearest) continue;
-        nearest=distance; target=w;
+        nearest=distance; target=w; zone=f;
         double rx=(point.x-f.origin.x)/f.size.width;
         if(rx<.2) placement=HSTRIP_BEFORE_COLUMN;
         else if(rx>.8) placement=HSTRIP_AFTER_COLUMN;
         else placement=point.y<CGRectGetMidY(f)?HSTRIP_ABOVE:HSTRIP_BELOW;
+        if(w->id==hwm_drop_target) {
+            // Hysteresis: a zone, once chosen, is kept slightly past its boundary.
+            double ry=(point.y-f.origin.y)/f.size.height;
+            if((hwm_drop_placement==HSTRIP_BEFORE_COLUMN && rx<.27) ||
+               (hwm_drop_placement==HSTRIP_AFTER_COLUMN && rx>.73) ||
+               (hwm_drop_placement==HSTRIP_ABOVE && rx>.13 && rx<.87 && ry<.58) ||
+               (hwm_drop_placement==HSTRIP_BELOW && rx>.13 && rx<.87 && ry>.42)) placement=hwm_drop_placement;
+        }
     }
-    CGRect preview=CGRectNull;
-    if(target && hwm_place(view,window->id,target->id,placement,false,&preview)) {
-        hwm_drop_target=target->id; hwm_drop_placement=placement;
-        hwm_preview_set(preview,actual);
-    } else { hwm_drop_target=0; hwm_preview_hide(); }
+    if(!target) { hwm_drop_target=0; hwm_preview_hide(); return; }
+    bool changed=hwm_drop_target!=target->id || hwm_drop_placement!=placement;
+    // Validity depends only on the pair and the placement, so test it once per zone.
+    if(changed && !hwm_place(view,window->id,target->id,placement,false,NULL)) { hwm_drop_target=0; hwm_preview_hide(); return; }
+    hwm_drop_target=target->id; hwm_drop_placement=placement;
+    double gap=view->window_gap; CGRect preview;
+    if(placement==HSTRIP_BEFORE_COLUMN) preview=CGRectMake(zone.origin.x-gap*.5-2,bounds.origin.y,4,bounds.size.height);
+    else if(placement==HSTRIP_AFTER_COLUMN) preview=CGRectMake(CGRectGetMaxX(zone)+gap*.5-2,bounds.origin.y,4,bounds.size.height);
+    else preview=CGRectMake(zone.origin.x,placement==HSTRIP_ABOVE?zone.origin.y:CGRectGetMidY(zone),zone.size.width,zone.size.height*.5);
+    preview=CGRectIntegral(preview);
+    hwm_preview_show(preview,CGRectInset(preview,preview.size.width>8?preview.size.width*.08:0,preview.size.height*.08),changed);
 }
 static bool horizontal_drag(CGEventRef event)
 {
@@ -680,27 +1133,42 @@ static bool horizontal_drag(CGEventRef event)
     struct view *view=window?window_manager_find_managed_window(&g_window_manager,window):NULL;
     if(!hwm_ready || hwm_paused || !view || view->layout!=VIEW_STRIP) return false;
     CGPoint point=CGEventGetLocation(event);
+    if(hwm_drag_cancelled) return true;
+    hwm_drag_point=point; ++hwm_prof_drag_events;
+    if(hwm_edge_window==window->id) {
+        if(g_mouse_state.current_action==MOUSE_MODE_RESIZE) {
+            double dx=point.x-g_mouse_state.down_location.x,dy=point.y-g_mouse_state.down_location.y;
+            window_manager_resize_window_relative_internal(window,hwm_edge_origin,g_mouse_state.direction,dx,dy,false);
+        }
+        hwm_edge_update(window,view); return true;
+    }
     if(g_mouse_state.current_action==MOUSE_MODE_MOVE) {
-        hwm_drag_window=window->id;
-        scripting_addition_set_layer(window->id,LAYER_NORMAL);
-        scripting_addition_move_window(window->id,g_mouse_state.window_frame.origin.x+point.x-g_mouse_state.down_location.x,
-                                       g_mouse_state.window_frame.origin.y+point.y-g_mouse_state.down_location.y);
+        hwm_drag_started(window);
+        // Pointer events can far outrun the display. The window is moved once
+        // per frame from the tick, to the latest position only.
+        hwm_drag_move=CGPointMake(g_mouse_state.window_frame.origin.x+point.x-g_mouse_state.down_location.x,
+                                  g_mouse_state.window_frame.origin.y+point.y-g_mouse_state.down_location.y);
+        hwm_drag_move_pending=true;
     }
     if(!hwm_drag_window && g_mouse_state.current_action==MOUSE_MODE_NONE) {
         CGRect actual=CGRectNull; SLSGetWindowBounds(g_connection,window->id,&actual);
         if(!CGRectIsNull(actual) && hypot(point.x-g_mouse_state.down_location.x,point.y-g_mouse_state.down_location.y)>3 &&
            hypot(actual.origin.x-g_mouse_state.window_frame.origin.x,actual.origin.y-g_mouse_state.window_frame.origin.y)>2) {
-            hwm_drag_window=window->id; scripting_addition_set_layer(window->id,LAYER_NORMAL);
+            hwm_drag_started(window);
         }
     }
-    if(hwm_drag_window==window->id) hwm_drag_update(view,window,point);
+    if(hwm_drag_window==window->id) hwm_wake();
     return true;
 }
 static bool horizontal_drop(struct window *window, CGPoint point)
 {
     struct view *view=window_manager_find_managed_window(&g_window_manager,window);
     if(!hwm_ready || hwm_paused || !view || view->layout!=VIEW_STRIP) return false;
+    if(hwm_drag_cancelled) { hwm_drag_cancelled=false; hwm_layout(view,true); return true; }
+    if(hwm_edge_finish(window,view)) return true;
     if(hwm_drag_window==window->id) {
+        hwm_drag_point=point;
+        if(hwm_drag_move_pending) { hwm_drag_move_pending=false; scripting_addition_move_window(window->id,hwm_drag_move.x,hwm_drag_move.y); }
         hwm_drag_update(view,window,point);
         CGRect actual=window->frame,bounds=hwm_bounds(view);
         SLSGetWindowBounds(g_connection,window->id,&actual);
@@ -711,11 +1179,50 @@ static bool horizontal_drop(struct window *window, CGPoint point)
         window->strip_height=window->strip_from_height=actual.size.height;
         window->strip_last_frame=actual; window->strip_last_offset=view->strip_offset; window->strip_start=hwm_now();
         hwm_drag_window=0;
+        scripting_addition_set_shadow(window->id,hwm_drag_shadow);
         scripting_addition_set_layer(window->id,LAYER_BELOW);
         if(!hwm_drop_target || !hwm_place(view,window->id,hwm_drop_target,hwm_drop_placement,true,NULL)) hwm_layout(view,true);
         hwm_drop_target=0; hwm_preview_hide(); hwm_hold_focus();
     }
     return true;
+}
+
+static void hwm_drag_autoscroll(struct view *view,double now)
+{
+    double dt=fmin(.04,fmax(0,now-hwm_drag_tick_time)); hwm_drag_tick_time=now;
+    struct window *w=window_manager_find_window(&g_window_manager,hwm_drag_window);
+    if(!w || hwm_drag_cancelled) return;
+    // Track the live cursor, not the last queued event: the window and the
+    // drop zone then follow the pointer however busy the event queue is.
+    CGPoint cursor;
+    if(SLSGetCurrentCursorLocation(g_connection,&cursor)==kCGErrorSuccess && g_mouse_state.window==w) {
+        hwm_drag_point=cursor;
+        if(g_mouse_state.current_action==MOUSE_MODE_MOVE) {
+            CGPoint to=CGPointMake(round(g_mouse_state.window_frame.origin.x+cursor.x-g_mouse_state.down_location.x),
+                                   round(g_mouse_state.window_frame.origin.y+cursor.y-g_mouse_state.down_location.y));
+            if(hwm_drag_move_pending || !CGPointEqualToPoint(to,hwm_drag_move)) { hwm_drag_move=to; hwm_drag_move_pending=true; }
+        }
+    }
+    if(hwm_drag_move_pending) { hwm_drag_move_pending=false; scripting_addition_move_window(w->id,hwm_drag_move.x,hwm_drag_move.y); }
+    CGRect bounds=hwm_bounds(view); double speed=0;
+    if(hwm_drag_point.x<bounds.origin.x+56) speed=-fmin(1,(bounds.origin.x+56-hwm_drag_point.x)/56);
+    else if(hwm_drag_point.x>CGRectGetMaxX(bounds)-56) speed=fmin(1,(hwm_drag_point.x-CGRectGetMaxX(bounds)+56)/56);
+    // Holding a window against an edge keeps accelerating, so carrying it the
+    // length of a long strip takes a moment rather than a slow crawl.
+    static double edge_since; static int edge_side;
+    int side=speed<0?-1:speed>0?1:0;
+    if(side!=edge_side) { edge_side=side; edge_since=now; }
+    if(speed) hwm_scroll(view,view->strip_offset+speed*900*(1+fmin(5,(now-edge_since)*2.5))*dt,false);
+    hwm_drag_update(view,w,hwm_drag_point);
+}
+static void hwm_cancel_drag(void)
+{
+    struct window *w=window_manager_find_window(&g_window_manager,hwm_drag_window);
+    if(!w) return;
+    hwm_drag_window=0; hwm_drop_target=0; hwm_drag_cancelled=true;
+    scripting_addition_set_shadow(w->id,hwm_drag_shadow);
+    scripting_addition_set_layer(w->id,LAYER_BELOW);
+    hwm_preview_hide(); hwm_undo_restore(); hwm_hold_focus();
 }
 
 static uint64_t horizontal_destination(struct window *window, uint64_t sid)
@@ -744,6 +1251,22 @@ static bool hwm_number(struct token token, double *out)
 static void horizontal_command(FILE *rsp, char *message)
 {
     struct token command = get_token(&message);
+    if(command.length>0 && command.length<80) {
+        char name[80]; memcpy(name,command.text,command.length); name[command.length]=0;
+        if(hwm_named_action(name)) return;
+    }
+    if(token_equals(command,"config-status")) {
+        TanaConfigSnapshot *snapshot=[hwm_config copySnapshot];
+        NSData *json=[NSJSONSerialization dataWithJSONObject:@{@"path":hwm_config.path,@"motionStrength":@(snapshot.motionStrength),@"effectiveMotionStrength":@(hwm_motion_scale),@"showStripMap":@(snapshot.showStripMap),@"autofocus":hwm_pointer_focus?@"pointer-movement":@"after-scroll",@"shortcutConflicts":snapshot.shortcutConflicts,@"error":hwm_config.lastError ?: @"",@"problems":hwm_config_problems ?: @[],@"hotReload":@(hwm_hot_reload),@"snap":@(hwm_snap),@"border":@(hwm_border_on()),@"inactiveOpacity":@(hwm_inactive_alpha),@"windowDuration":@(hwm_duration)} options:0 error:NULL];
+        fwrite(json.bytes,1,json.length,rsp); fputc('\n',rsp); [snapshot release]; return;
+    }
+    if(token_equals(command,"profile") || token_equals(command,"profile-reset")) {
+        fprintf(rsp,"{\"ax_resizes\":%llu,\"ax_resizes_coalesced\":%llu,\"ax_resize_max_ms\":%.3f,\"drag_ms\":%.3f,\"render_ms\":%.3f,\"extras_ms\":%.3f,\"preview_ms\":%.3f,\"feedback_ms\":%.3f,\"tick_while_dragging_ms\":%.3f,\"drag_ticks\":%llu,\"drag_events\":%llu,\"overlay_refreshes\":%llu,\"overlay_refresh_max_ms\":%.3f,\"max_frame_ms\":%.3f}\n",
+                (unsigned long long)hwm_ax_resizes_sent,(unsigned long long)hwm_ax_resizes_coalesced,(double)hwm_ax_resize_max_ms,hwm_prof[HWM_PROF_DRAG],hwm_prof[HWM_PROF_RENDER],hwm_prof[HWM_PROF_EXTRAS],hwm_prof[HWM_PROF_PREVIEW],hwm_prof[HWM_PROF_FEEDBACK],hwm_prof[HWM_PROF_TICK_DRAGGING],
+                (unsigned long long)hwm_prof_drag_ticks,(unsigned long long)hwm_prof_drag_events,(unsigned long long)hwm_feedback_shows,(double)hwm_feedback_show_max_ms,hwm_max_frame_ms);
+        if(token_equals(command,"profile-reset")) { memset(hwm_prof,0,sizeof(hwm_prof)); hwm_prof_drag_ticks=0; hwm_prof_drag_events=0; hwm_feedback_shows=0; hwm_feedback_show_max_ms=0; hwm_ax_resizes_sent=0; hwm_ax_resizes_coalesced=0; hwm_ax_resize_max_ms=0; hwm_max_frame_ms=0; hwm_slow_frames=0; hwm_frames=0; }
+        return;
+    }
     if(token_equals(command,"overview")) { hwm_action(HWM_OVERVIEW); return; }
     if(token_equals(command,"overview-cancel")) { hwm_action(HWM_OVERVIEW_CANCEL); return; }
     if(token_equals(command,"overview-progress")) {
@@ -758,10 +1281,10 @@ static void horizontal_command(FILE *rsp, char *message)
     struct view *view = hwm_view();
     if (token_equals(command,"input-status")) {
         CFMachPortRef tap=__atomic_load_n(&g_mouse_state.handle,__ATOMIC_RELAXED);
-        fprintf(rsp,"{\"tap_enabled\":%s,\"key_actions\":%llu,\"suspended\":%s,\"overview\":%s,\"overview_renderer\":\"native\",\"overview_windows\":%u,\"overview_frames\":%llu,\"overview_frames_over_8ms\":%llu,\"overview_max_frame_ms\":%.3f,\"vertical_progress\":%.4f}\n",tap&&CGEventTapIsEnabled(tap)?"true":"false",(unsigned long long)hwm_key_actions,hwm_suspended?"true":"false",hwm_overview_active?"true":"false",(unsigned)hwm_overview_window_count,(unsigned long long)hwm_overview_frames,(unsigned long long)hwm_overview_slow_frames,hwm_overview_max_frame_ms,hwm_vertical_last_progress); return;
+        fprintf(rsp,"{\"tap_enabled\":%s,\"key_actions\":%llu,\"suspended\":%s,\"overview\":%s,\"overview_renderer\":\"native\",\"overview_windows\":%u,\"overview_frames\":%llu,\"overview_frames_over_8ms\":%llu,\"overview_max_frame_ms\":%.3f,\"vertical_progress\":%.4f,\"overview_closing\":%s,\"overview_animating\":%s,\"overview_gesture_active\":%s,\"mission_control\":%s}\n",tap&&CGEventTapIsEnabled(tap)?"true":"false",(unsigned long long)hwm_key_actions,hwm_suspended?"true":"false",hwm_overview_active?"true":"false",(unsigned)hwm_overview_window_count,(unsigned long long)hwm_overview_frames,(unsigned long long)hwm_overview_slow_frames,hwm_overview_max_frame_ms,hwm_vertical_last_progress,hwm_overview_closing?"true":"false",hwm_overview_animating?"true":"false",hwm_overview_gesture_active?"true":"false",mission_control_is_active()?"true":"false"); return;
     }
     if (token_equals(command,"status")) {
-        fprintf(rsp,"{\"version\":\"0.1.0\",\"ready\":%s,\"paused\":%s,\"backend\":%s,\"space\":%llu,\"offset\":%.3f,\"autofocus\":%s,\"frames\":%llu,\"frames_over_8ms\":%llu,\"max_frame_ms\":%.3f,\"move_failures\":%llu,\"resize_operations\":%llu,\"windows\":[",hwm_ready?"true":"false",hwm_paused?"true":"false",hwm_backend_ok?"true":"false",(unsigned long long)hwm_space,view?view->strip_offset:0,g_window_manager.ffm_mode==FFM_AUTOFOCUS?"true":"false",(unsigned long long)hwm_frames,(unsigned long long)hwm_slow_frames,hwm_max_frame_ms,(unsigned long long)hwm_move_failures,(unsigned long long)hwm_resize_operations);
+        fprintf(rsp,"{\"version\":\"0.2.0\",\"ready\":%s,\"paused\":%s,\"backend\":%s,\"space\":%llu,\"offset\":%.3f,\"autofocus\":%s,\"frames\":%llu,\"frames_over_8ms\":%llu,\"max_frame_ms\":%.3f,\"move_failures\":%llu,\"resize_operations\":%llu,\"windows\":[",hwm_ready?"true":"false",hwm_paused?"true":"false",hwm_backend_ok?"true":"false",(unsigned long long)hwm_space,view?view->strip_offset:0,g_window_manager.ffm_mode==FFM_AUTOFOCUS?"true":"false",(unsigned long long)hwm_frames,(unsigned long long)hwm_slow_frames,hwm_max_frame_ms,(unsigned long long)hwm_move_failures,(unsigned long long)hwm_resize_operations);
         bool comma = false;
         if (view) for (struct window_node *n = window_node_find_first_leaf(view->root); n; n = window_node_find_next_leaf(n)) {
             for (int i=0;i<n->window_count;++i) {
@@ -782,6 +1305,7 @@ static void horizontal_command(FILE *rsp, char *message)
         if(token_equals(position,"above")) placement=HSTRIP_ABOVE;
         if(token_equals(position,"below")) placement=HSTRIP_BELOW;
         bool commit=token_equals(command,"place"); CGRect preview=CGRectNull;
+        if(commit) hwm_undo_capture();
         if(placement<0 || !hwm_place(view,(uint32_t)source,(uint32_t)target,placement,commit,commit?NULL:&preview)) daemon_fail(rsp,"invalid placement\n");
         else if(!commit) {
             CGRect actual=CGRectNull; SLSGetWindowBounds(g_connection,(uint32_t)source,&actual);
@@ -792,55 +1316,104 @@ static void horizontal_command(FILE *rsp, char *message)
     if (token_equals(command,"scroll") || token_equals(command,"width")) {
         double value;
         if (!hwm_number(get_token(&message),&value)) { daemon_fail(rsp,"expected a finite number\n"); return; }
-        if (token_equals(command,"scroll")) hwm_scroll(view,value,true);
+        if (token_equals(command,"scroll")) { hwm_scroll(view,value,true); hwm_focus_follow_to(view,view->strip_target_offset); }
         else {
             struct window *w = window_manager_find_window(&g_window_manager,g_window_manager.focused_window_id);
             if (!w || !hwm_focused_node(view)) { daemon_fail(rsp,"focus a tiled window first\n"); return; }
             if (value<240 || value>hwm_bounds(view).size.width) { daemon_fail(rsp,"width must be between 240 and the viewport width\n"); return; }
-            hwm_column_width(view,w,value); hwm_layout(view,true);
+            hwm_undo_capture(); hwm_column_width(view,w,value); hwm_layout(view,true);
         }
         return;
     }
     char *names[] = {"left","right","move-left","move-right","float","full","center","home","pause","reflow"};
     int actions[] = {HWM_LEFT,HWM_RIGHT,HWM_MOVE_LEFT,HWM_MOVE_RIGHT,HWM_FLOAT,HWM_FULL,HWM_CENTER,HWM_HOME,HWM_PAUSE,HWM_REFLOW};
     for (int i=0;i<10;++i) if (token_equals(command,names[i])) { hwm_action(actions[i]); return; }
-    daemon_fail(rsp,"strip commands: status, left, right, move-left, move-right, float, full, center, home, scroll <offset>, width <points>, pause, reflow\n");
+    daemon_fail(rsp,"strip commands: status, config-status, left, right, move-left, move-right, move-first, move-last, float, full, center, home, scroll <offset>, width <points>, overview, commands, reload-config, pause, reflow, quit\n");
 }
 
+/* One list feeds both the menu and the command palette. */
+static NSArray *hwm_command_sections(void)
+{
+    return @[
+      @[@"Navigate",@[@[@"overview",@"Window overview"],@[@"left",@"Focus left"],@[@"right",@"Focus right"],@[@"up",@"Focus row / tab above"],@[@"down",@"Focus row / tab below"],
+                      @[@"previous",@"Return to previous window"],@[@"center",@"Center window"],@[@"home",@"Return to left wall"]]],
+      @[@"Arrange",@[@[@"move-left",@"Swap with left column"],@[@"move-right",@"Swap with right column"],@[@"move-first",@"Move to start of strip"],@[@"move-last",@"Move to end of strip"],
+                     @[@"preset-width",@"Cycle column width"],@[@"fit-two",@"Fit this column and next"],@[@"full",@"Fill screen / restore"],
+                     @[@"consume",@"Pull next window into stack"],@[@"expel",@"Push window out of stack"],@[@"tabs",@"Stack / tabs"],@[@"undo",@"Undo arrangement"]]],
+      @[@"Window",@[@[@"float",@"Float / tile"],@[@"utility-mark",@"Mark / unmark utility window"],@[@"utility",@"Summon / dismiss utility"],@[@"close",@"Close window"],
+                    @[@"terminal",@"New terminal"],@[@"browser",@"Open browser"]]],
+      @[@"This app",@[@[@"remember-width",@"Remember current width"],@[@"remember-floating",@"Toggle open floating"],@[@"remember-beside",@"Toggle open beside current"]]],
+      @[@"Tana",@[@[@"reload-config",@"Reload config file"],@[@"pause",@"Pause / resume"],@[@"reflow",@"Reflow windows"]]]];
+}
+static NSArray *hwm_palette_commands(void)
+{
+    NSMutableArray *commands=[NSMutableArray array];
+    TanaConfigSnapshot *snapshot=[hwm_config copySnapshot];
+    for(NSArray *section in hwm_command_sections()) for(NSArray *entry in section[1])
+        [commands addObject:@[entry[0],[NSString stringWithFormat:@"%@: %@",section[0],entry[1]],TanaBindingDescription(snapshot.shortcuts[entry[0]])]];
+    [commands addObject:@[@"quit",@"Tana: Quit and restore windows",@""]];
+    [snapshot release];
+    return commands;
+}
+/* A menu key equivalent for a binding, or nil when AppKit cannot display it. */
+static NSString *hwm_key_equivalent(TanaShortcutBinding *binding)
+{
+    static NSDictionary *special;
+    if(!special) special=[@{@"left":[NSString stringWithFormat:@"%C",(unichar)NSLeftArrowFunctionKey],@"right":[NSString stringWithFormat:@"%C",(unichar)NSRightArrowFunctionKey],
+        @"up":[NSString stringWithFormat:@"%C",(unichar)NSUpArrowFunctionKey],@"down":[NSString stringWithFormat:@"%C",(unichar)NSDownArrowFunctionKey],
+        @"return":@"\r",@"space":@" ",@"tab":@"\t",@"escape":@"\e",@"delete":@"\b"} retain];
+    for(NSString *candidate in [[tana_key_codes() allKeys] sortedArrayUsingSelector:@selector(compare:)]) {
+        if([tana_key_codes()[candidate] unsignedShortValue]!=binding.keyCode || [candidate isEqual:@"enter"] || [candidate isEqual:@"esc"]) continue;
+        return special[candidate] ?: candidate;
+    }
+    return nil;
+}
 @interface HorizontalMenu : NSObject
 @property(nonatomic, retain) NSStatusItem *item;
-- (void)action:(NSMenuItem *)sender;
-- (void)quit:(id)sender;
+- (void)named:(NSMenuItem *)sender;
 @end
 @implementation HorizontalMenu
-- (void)action:(NSMenuItem *)sender { event_loop_post(&g_event_loop,HORIZONTAL_INPUT,NULL,(int)sender.tag); }
-- (void)quit:(id)sender { (void)sender; event_loop_post(&g_event_loop,HORIZONTAL_INPUT,NULL,HWM_QUIT); }
+- (void)named:(NSMenuItem *)sender { event_loop_post(&g_event_loop,HORIZONTAL_INPUT,strdup([sender.representedObject UTF8String]),HWM_NAMED_ACTION); }
 @end
 static HorizontalMenu *hwm_menu;
+static void hwm_menu_refresh_bindings(void)
+{
+    if(!hwm_menu) return;
+    TanaConfigSnapshot *snapshot=[hwm_config copySnapshot];
+    for(NSMenuItem *item in hwm_menu.item.menu.itemArray) {
+        if(![item.representedObject isKindOfClass:[NSString class]]) continue;
+        TanaShortcutBinding *binding=snapshot.shortcuts[item.representedObject];
+        NSString *key=binding ? hwm_key_equivalent(binding) : nil;
+        // Real key equivalents: AppKit right-aligns them like any other menu.
+        item.keyEquivalent=key ?: @"";
+        item.keyEquivalentModifierMask=key ? (binding.modifiers&(NSEventModifierFlagCommand|NSEventModifierFlagOption|NSEventModifierFlagControl|NSEventModifierFlagShift)) : 0;
+    }
+    [snapshot release];
+}
 static void hwm_menu_begin(void)
 {
     [NSApp setActivationPolicy:NSApplicationActivationPolicyAccessory];
     hwm_menu = [HorizontalMenu new];
     hwm_menu.item = [[NSStatusBar systemStatusBar] statusItemWithLength:NSVariableStatusItemLength];
-    hwm_menu.item.button.title = @"↔";
+    NSImage *symbol=[NSImage imageWithSystemSymbolName:@"rectangle.split.3x1" accessibilityDescription:@"Tana"];
+    if(symbol) { symbol.template=YES; hwm_menu.item.button.image=symbol; } else hwm_menu.item.button.title = @"↔";
     hwm_menu.item.button.toolTip = @"Tana — one continuous window strip";
     NSMenu *menu = [[[NSMenu alloc] initWithTitle:@"Tana"] autorelease];
-    NSMenuItem *overview=[[[NSMenuItem alloc] initWithTitle:@"Window overview — three-finger swipe up" action:@selector(action:) keyEquivalent:@""] autorelease];
-    overview.target=hwm_menu; overview.tag=HWM_OVERVIEW; [menu addItem:overview];
-    [menu addItem:[NSMenuItem separatorItem]];
-    NSArray *labels = @[@"Focus previous                 ⌥⌘←",@"Focus next                       ⌥⌘→",@"Move left                       ⇧⌥⌘←",@"Move right                     ⇧⌥⌘→",@"Float / tile                         ⌘Space",@"Fill screen / restore            ⇧⌘Return",@"Center window                   ⌥⌘C",@"Return to left wall               ⌥⌘0",@"Pause / resume",@"Reflow windows",@"Close window                       ⌘Q",@"New terminal                       ⌘Return",@"Open Firefox                       ⇧⌘W"];
-    int actions[] = {HWM_LEFT,HWM_RIGHT,HWM_MOVE_LEFT,HWM_MOVE_RIGHT,HWM_FLOAT,HWM_FULL,HWM_CENTER,HWM_HOME,HWM_PAUSE,HWM_REFLOW,HWM_CLOSE,HWM_TERMINAL,HWM_BROWSER};
-    for (int i=0;i<(int)labels.count;++i) {
-        NSMenuItem *item = [[[NSMenuItem alloc] initWithTitle:labels[i] action:@selector(action:) keyEquivalent:@""] autorelease];
-        item.target = hwm_menu; item.tag = actions[i]; [menu addItem:item];
+    NSMenuItem *palette=[[[NSMenuItem alloc] initWithTitle:@"Command Palette…" action:@selector(named:) keyEquivalent:@""] autorelease];
+    palette.target=hwm_menu; palette.representedObject=@"commands"; [menu addItem:palette];
+    for(NSArray *section in hwm_command_sections()) {
+        [menu addItem:[NSMenuItem separatorItem]];
+        if(@available(macOS 14.0,*)) [menu addItem:[NSMenuItem sectionHeaderWithTitle:section[0]]];
+        for(NSArray *entry in section[1]) {
+            NSMenuItem *item=[[[NSMenuItem alloc] initWithTitle:entry[1] action:@selector(named:) keyEquivalent:@""] autorelease];
+            item.target=hwm_menu; item.representedObject=entry[0]; [menu addItem:item];
+        }
     }
     [menu addItem:[NSMenuItem separatorItem]];
-    for (NSString *label in @[@"Three-finger swipe: navigate",@"Option + two-finger scroll: resize",@"Drag onto a window: stack above / below",@"Option + Shift + scroll: navigate"]) {
-        NSMenuItem *item = [[[NSMenuItem alloc] initWithTitle:label action:nil keyEquivalent:@""] autorelease]; [menu addItem:item];
-    }
-    [menu addItem:[NSMenuItem separatorItem]];
-    NSMenuItem *quit = [[[NSMenuItem alloc] initWithTitle:@"Quit Tana" action:@selector(quit:) keyEquivalent:@""] autorelease]; quit.target = hwm_menu; [menu addItem:quit];
+    NSMenuItem *quit=[[[NSMenuItem alloc] initWithTitle:@"Quit Tana" action:@selector(named:) keyEquivalent:@""] autorelease];
+    quit.target=hwm_menu; quit.representedObject=@"quit"; [menu addItem:quit];
     hwm_menu.item.menu = menu;
+    hwm_menu_refresh_bindings();
     [[NSDistributedNotificationCenter defaultCenter] addObserverForName:@"com.apple.screenIsLocked" object:nil queue:[NSOperationQueue mainQueue] usingBlock:^(NSNotification *n) {
         (void)n; hwm_suspended=true;
         [[HorizontalWindowOverview sharedOverview] dismissImmediately];
@@ -854,13 +1427,28 @@ static void hwm_menu_begin(void)
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW,(int64_t)(.4*NSEC_PER_SEC)),dispatch_get_main_queue(),^{ event_loop_post(&g_event_loop,HORIZONTAL_RESUME,NULL,0); });
     }];
 }
+
+/* Bring every window's opacity in line with the dim setting, or (restore) hand
+ * back full opacity to those Tana changed. Untouched windows are left alone. */
+static void hwm_alpha_sync(bool restore)
+{
+    table_for(struct window *w,g_window_manager.window, {
+        if(!w->is_root || w->strip_pop || w->strip_close_pending || !window_manager_is_window_eligible(w) || !window_is_standard(w)) continue;
+        float current=w->strip_alpha>0 ? w->strip_alpha : 1;
+        float target=restore ? 1 : hwm_window_alpha(w);
+        if(fabsf(current-target)<.001f) continue;
+        scripting_addition_set_opacity(w->id,target,.16f);
+        w->strip_alpha=target;
+    })
+}
+
 static NSString *hwm_state_path(void)
 {
     NSString *base=[NSHomeDirectory() stringByAppendingPathComponent:@"Library/Application Support"];
     NSString *current=[base stringByAppendingPathComponent:@"Tana"];
     NSString *legacy=[base stringByAppendingPathComponent:@"HorizontalWM"];
     NSFileManager *files=[NSFileManager defaultManager];
-    NSString *directory=![files fileExistsAtPath:current] && [files fileExistsAtPath:legacy] ? legacy : current;
+    NSString *directory=![files fileExistsAtPath:[current stringByAppendingPathComponent:@"layout.json"]] && [files fileExistsAtPath:[legacy stringByAppendingPathComponent:@"layout.json"]] ? legacy : current;
     return [directory stringByAppendingPathComponent:@"layout.json"];
 }
 static long long hwm_boot_time(void)
@@ -880,7 +1468,7 @@ static void hwm_save_state(void)
         if (!window_manager_is_window_eligible(w) || !window_is_standard(w)) continue;
         [windows addObject:(@{@"id":@(w->id),@"pid":@(w->application->pid),@"width":@(w->strip_width),@"restore_width":@(w->strip_saved_width),@"full":@(w->strip_full_width),@"floating":@(window_check_flag(w,WINDOW_FLOAT)),@"column":@(w->strip_column),@"weight":@(w->strip_weight)})];
     })
-    NSDictionary *state=@{@"version":@1,@"boot":@(hwm_boot_time()),@"offset":@(view->strip_target_offset),@"order":order,@"windows":windows};
+    NSDictionary *state=@{@"version":@1,@"boot":@(hwm_boot_time()),@"offset":@(view->strip_target_offset),@"order":order,@"windows":windows,@"workflow":hwm_workflow_save()};
     NSString *path=hwm_state_path();
     NSError *error=nil;
     [[NSFileManager defaultManager] createDirectoryAtPath:path.stringByDeletingLastPathComponent withIntermediateDirectories:YES attributes:@{NSFilePosixPermissions:@0700} error:&error];
@@ -929,6 +1517,7 @@ static void hwm_load_state(void)
         [matched removeObject:identifier];
         slot=window_node_find_next_leaf(slot);
     }
+    hwm_workflow_load(state[@"workflow"]);
     if ([state[@"offset"] isKindOfClass:[NSNumber class]]) hwm_scroll(view,[state[@"offset"] doubleValue],false);
 }
 static void hwm_signal_stop(int signal_number) { (void)signal_number; hwm_stop_requested = 1; }
@@ -952,6 +1541,7 @@ static void horizontal_window_added(struct window *window)
     hwm_remember(window);
     if (!hwm_ready) return;
     horizontal_destination(window,window_space(window->id));
+    hwm_apply_app_rule(window);
     if (window_check_flag(window,WINDOW_FLOAT)) scripting_addition_set_layer(window->id,LAYER_ABOVE);
 }
 static void hwm_shutdown(void)
@@ -959,7 +1549,10 @@ static void hwm_shutdown(void)
     if (!hwm_ready) return;
     horizontal_overview_done();
     hwm_preview_hide_immediately();
+    hwm_feedback_hide();
     hwm_cancel_closing();
+    hwm_cancel_pops();
+    hwm_alpha_sync(true);
     hwm_save_state();
     hwm_ready = false;
     __atomic_store_n(&hwm_active,false,__ATOMIC_RELEASE);
@@ -988,6 +1581,7 @@ static void horizontal_begin(void)
     // set-front-window signature. AX supplies window activation separately.
     hwm_backend_ok = scripting_addition_request_handshake(helper_version,sizeof(helper_version),&helper_attributes);
     if (!hwm_backend_ok) error("Tana: yabai scripting addition is unavailable; no windows were moved. Load the existing helper before starting.\n");
+    hwm_config_begin();
     hwm_ready = true;
     signal(SIGTERM, hwm_signal_stop);
     signal(SIGINT, hwm_signal_stop);
@@ -1015,6 +1609,9 @@ static void horizontal_begin(void)
     hwm_resume_load_state=observed==0;
     if(!hwm_resume_load_state) hwm_load_state();
     hwm_layout(hwm_view(),true);
+    hwm_external_borders_refresh();
+    hwm_alpha_focus=hwm_feedback_focus_id=g_window_manager.focused_window_id;
+    hwm_alpha_sync(false);
     dispatch_async(dispatch_get_main_queue(), ^{ hwm_menu_begin(); });
 }
 
@@ -1094,15 +1691,22 @@ static void horizontal_ordered(uint32_t wid)
 static void horizontal_reconcile(void)
 {
     __atomic_store_n(&hwm_reconcile_pending,false,__ATOMIC_RELEASE);
+    if(hwm_ready && !hwm_suspended) hwm_config_poll();
     if(!hwm_ready || hwm_suspended || hwm_paused || hwm_overview_active || mission_control_is_active()) return;
     double now=hwm_now();
     // Retained Cocoa windows can close without an AX destruction notification.
     // WindowServer ordering catches that case without polling Accessibility.
     table_for(struct window *w,g_window_manager.window, {
+        if(w->strip_close_ghost && !w->strip_close_pending && now-w->strip_ghost_time>1.0) {
+            // The application kept the window (a save prompt, say): give it its place back.
+            w->strip_close_ghost=false;
+            struct view *home=window_manager_find_managed_window(&g_window_manager,w);
+            if(home && home->layout==VIEW_STRIP) hwm_layout(home,true);
+        }
         if(w->strip_initialized || w->strip_ordered_out) horizontal_ordered(w->id);
         struct view *view=window_manager_find_managed_window(&g_window_manager,w);
         if(view && view->layout==VIEW_STRIP && w->strip_initialized &&
-           !w->strip_ordered_out && w->id!=hwm_drag_window && g_mouse_state.window!=w &&
+           !w->strip_ordered_out && !hwm_workflow_tab_hidden(w) && w->id!=hwm_drag_window && g_mouse_state.window!=w &&
            !hwm_view_in_motion(view,now) && !w->strip_size_pending &&
            now-w->strip_start>hwm_duration+.1 && !CGRectIsNull(w->strip_last_frame)) {
             // AppKit can constrain an off-screen window after our final move.
@@ -1130,8 +1734,12 @@ static void horizontal_focus_requested(uint32_t wid)
 static void horizontal_focus_transition(struct window *previous,struct window *next)
 {
     if(!hwm_ready || !previous || previous==next) return;
+    hwm_feedback_focus(previous,next);
+    if(next) { hwm_alpha_focus=next->id; if(hwm_inactive_alpha<1 && !hwm_paused) hwm_alpha_sync(false); }
     hwm_previous_focus=previous->id; hwm_previous_focus_time=hwm_now();
     struct view *view=hwm_view();
     hwm_previous_focus_offset=view?hwm_offset(view,hwm_now()):0;
     horizontal_ordered(previous->id);
 }
+
+#include "strip_config_runtime.m"

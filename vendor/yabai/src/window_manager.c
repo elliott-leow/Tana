@@ -1328,15 +1328,27 @@ void window_manager_focus_window_with_raise(ProcessSerialNumber *window_psn, uin
 
 #if 1
     horizontal_focus_requested(window_id);
-    pid_t target_pid=0;
-    AXUIElementGetPid(window_ref,&target_pid);
-    NSRunningApplication *target_app=[NSRunningApplication runningApplicationWithProcessIdentifier:target_pid];
-    [target_app activateWithOptions:0];
-    AXUIElementSetAttributeValue(window_ref,kAXMainAttribute,kCFBooleanTrue);
-    AXUIElementSetAttributeValue(window_ref,kAXFocusedAttribute,kCFBooleanTrue);
-    _SLPSSetFrontProcessWithOptions(window_psn, window_id, kCPSUserGenerated);
-    window_manager_make_key_window(window_psn, window_id);
-    AXUIElementPerformAction(window_ref, kAXRaiseAction);
+    // Activation is three Accessibility round trips to the target application.
+    // They run in order on their own serial queue so a busy application delays
+    // only its own activation, never the frames being drawn meanwhile.
+    static dispatch_queue_t focus_queue; static dispatch_once_t focus_once;
+    dispatch_once(&focus_once, ^{ focus_queue = dispatch_queue_create("tana.focus", dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_USER_INTERACTIVE, 0)); });
+    ProcessSerialNumber psn = *window_psn;
+    if (!window_ref) return;
+    CFRetain(window_ref);
+    dispatch_async(focus_queue, ^{
+        ProcessSerialNumber target_psn = psn;
+        pid_t target_pid=0;
+        AXUIElementGetPid(window_ref,&target_pid);
+        NSRunningApplication *target_app=[NSRunningApplication runningApplicationWithProcessIdentifier:target_pid];
+        [target_app activateWithOptions:0];
+        AXUIElementSetAttributeValue(window_ref,kAXMainAttribute,kCFBooleanTrue);
+        AXUIElementSetAttributeValue(window_ref,kAXFocusedAttribute,kCFBooleanTrue);
+        _SLPSSetFrontProcessWithOptions(&target_psn, window_id, kCPSUserGenerated);
+        window_manager_make_key_window(&target_psn, window_id);
+        AXUIElementPerformAction(window_ref, kAXRaiseAction);
+        CFRelease(window_ref);
+    });
 #else
     scripting_addition_focus_window(window_id);
 #endif

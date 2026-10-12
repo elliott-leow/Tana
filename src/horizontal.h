@@ -1,5 +1,6 @@
 #ifndef HORIZONTAL_WM_H
 #define HORIZONTAL_WM_H
+#include <stdatomic.h>
 // All model mutations run on yabai's serialized event loop. The event tap and
 // display link only enqueue input/ticks; neither performs Accessibility work.
 static bool horizontal_flush_node(struct window_node *node);
@@ -36,3 +37,8 @@ static void horizontal_focus_requested(uint32_t wid);
 static void horizontal_focus_transition(struct window *previous,struct window *next);
 static void horizontal_overview_select(uint32_t wid, pid_t pid);
 static void horizontal_overview_done(void);
+
+static void horizontal_mouse_down(struct window *window, CGPoint point);
+static bool horizontal_resize_event(struct window *window);
+/* Set while a pointer event of that kind is queued; newer ones are dropped. */
+static _Atomic bool horizontal_moved_queued, horizontal_dragged_queued;

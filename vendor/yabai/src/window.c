@@ -501,7 +501,9 @@ void window_serialize(FILE *rsp, struct window *window, uint64_t flags)
         if (did_output) fprintf(rsp, ",\n");
 
         CGRect actual = window->frame;
-        SLSGetWindowBounds(g_connection,window->id,&actual);
+        CGRect observed=CGRectNull;
+        if(SLSGetWindowBounds(g_connection,window->id,&observed)==kCGErrorSuccess && !CGRectIsNull(observed) && !CGRectIsInfinite(observed)) actual=observed;
+        if(CGRectIsNull(actual) || CGRectIsInfinite(actual)) actual=CGRectZero;
         fprintf(rsp, "\t\"frame\":{\n\t\t\"x\":%.4f,\n\t\t\"y\":%.4f,\n\t\t\"w\":%.4f,\n\t\t\"h\":%.4f\n\t}", actual.origin.x, actual.origin.y, actual.size.width, actual.size.height);
         did_output = true;
     }

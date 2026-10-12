@@ -59,13 +59,18 @@ static MOUSE_HANDLER(mouse_handler)
     case kCGEventLeftMouseDragged:
     case kCGEventRightMouseDragged: {
         mouse_state->drag_detected = true;
-        event_loop_post(&g_event_loop, MOUSE_DRAGGED, (void *) CFRetain(event), 0);
+        // A pointer can report far faster than the display refreshes. Only one
+        // drag event waits in the queue at a time, so frames are never starved;
+        // the strip reads the live cursor position each frame regardless.
+        if (!atomic_exchange(&horizontal_dragged_queued, true))
+            event_loop_post(&g_event_loop, MOUSE_DRAGGED, (void *) CFRetain(event), 0);
     } break;
     case kCGEventMouseMoved: {
         uint8_t mod = mouse_mod_from_cgflags(CGEventGetFlags(event));
         if (mod == mouse_state->modifier) return event;
 
-        event_loop_post(&g_event_loop, MOUSE_MOVED, (void *) CFRetain(event), mod);
+        if (!atomic_exchange(&horizontal_moved_queued, true))
+            event_loop_post(&g_event_loop, MOUSE_MOVED, (void *) CFRetain(event), mod);
     } break;
     case /* kCGSEventDockControl */ 30: {
         int type = CGEventGetIntegerValueField(event, /* kCGEventGestureHIDType */ 110);

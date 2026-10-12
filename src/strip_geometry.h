@@ -25,6 +25,178 @@ typedef struct {
     double width;
 } HStripFrame;
 
+/* Analytic critically damped motion retains position AND velocity on retarget.
+ * The caller constrains the hard wall, not the spring's target integration. */
+static inline double hstrip_spring(double from,double target,double velocity,
+                                   double elapsed,double omega,double *out_velocity)
+{
+    double t=fmax(0,elapsed), a=from-target, b=velocity+omega*a;
+    double decay=exp(-omega*t);
+    *out_velocity=(velocity-omega*b*t)*decay;
+    return target+(a+b*t)*decay;
+}
+
+static inline double hstrip_nonnegative(double value);
+
+/* Spring with a damping ratio. zeta >= 1 is the critically damped form above;
+ * 0 < zeta < 1 overshoots ("bounce") and still retains velocity on retarget. */
+static inline double hstrip_spring_damped(double from,double target,double velocity,
+                                          double elapsed,double omega,double zeta,double *out_velocity)
+{
+    double unused;
+    if(!out_velocity) out_velocity=&unused;
+    if(!isfinite(zeta) || zeta>=.999) return hstrip_spring(from,target,velocity,elapsed,omega,out_velocity);
+    zeta=fmax(.2,zeta);
+    double t=fmax(0,elapsed), a=from-target, wd=omega*sqrt(1-zeta*zeta);
+    double b=(velocity+zeta*omega*a)/wd, decay=exp(-zeta*omega*t), c=cos(wd*t), s=sin(wd*t);
+    *out_velocity=decay*((b*wd-zeta*omega*a)*c-(a*wd+zeta*omega*b)*s);
+    return target+decay*(a*c+b*s);
+}
+
+/* Natural frequency whose response is within a fraction of a pixel of rest
+ * once `duration` has elapsed, so the final snap to the target is invisible. */
+static inline double hstrip_spring_omega(double duration,double zeta)
+{
+    if(!isfinite(zeta) || zeta>1) zeta=1;
+    return 10.5/(fmax(.2,zeta)*fmax(.001,duration));
+}
+
+/* Normalized 0..1 spring step: an ease-out whose slope starts at zero error. */
+static inline double hstrip_spring_progress(double elapsed,double duration)
+{
+    if(!isfinite(elapsed) || elapsed<=0) return 0;
+    if(elapsed>=duration) return 1;
+    double v; return hstrip_spring(0,1,0,elapsed,hstrip_spring_omega(duration,1),&v);
+}
+
+/* Resistance past a hard edge: displayed travel approaches `limit` asymptotically. */
+static inline double hstrip_rubber_band(double distance,double limit)
+{
+    if(!isfinite(distance) || distance<=0 || !isfinite(limit) || limit<=0) return 0;
+    return (1-1/(distance*.55/limit+1))*limit;
+}
+
+/*
+ * Pick the resting offset nearest `desired` at which some column is flush with
+ * the left or right viewport edge. `lefts`/`widths` describe columns in world
+ * coordinates. Snapping farther than `reach` is declined (returns desired).
+ */
+static inline double hstrip_snap_offset(double desired,double viewport_width,const double *lefts,
+                                        const double *widths,size_t count,double reach)
+{
+    double best=desired, distance=INFINITY;
+    if(!isfinite(desired) || !lefts || !widths) return hstrip_nonnegative(desired);
+    for(size_t i=0;i<count;i++) {
+        double candidates[2]={lefts[i],lefts[i]+widths[i]-viewport_width};
+        for(int j=0;j<2;j++) {
+            double c=candidates[j]<0?0:candidates[j], d=fabs(c-desired);
+            if(isfinite(c) && d<distance) { distance=d; best=c; }
+        }
+    }
+    return distance<=reach ? best : hstrip_nonnegative(desired);
+}
+
+/*
+ * Resting offset that centres the column whose centred position is nearest
+ * `desired`. A column wider than the viewport rests with its left edge showing.
+ * With no columns the desired offset is returned unchanged (left-clamped).
+ */
+static inline double hstrip_snap_center(double desired,double viewport_width,const double *lefts,
+                                        const double *widths,size_t count)
+{
+    double best=hstrip_nonnegative(desired), distance=INFINITY;
+    if(!isfinite(desired) || !lefts || !widths) return best;
+    for(size_t i=0;i<count;i++) {
+        double c=widths[i]>=viewport_width ? lefts[i] : lefts[i]+widths[i]*.5-viewport_width*.5;
+        if(c<0) c=0;
+        double d=fabs(c-desired);
+        if(isfinite(c) && d<distance) { distance=d; best=c; }
+    }
+    return best;
+}
+
+/*
+ * Resting offset after a swipe that began at `origin` and is heading for
+ * `desired`. `rests` are the candidate offsets in ascending order. Travelling
+ * more than `threshold` of the way to the neighbouring rest commits to it (or
+ * to whichever rest is nearest the destination if that is farther), so a short
+ * deliberate swipe changes column and a tiny one returns. Lower thresholds
+ * need less movement.
+ */
+static inline double hstrip_snap_directional(double origin,double desired,const double *rests,
+                                             size_t count,double threshold)
+{
+    if(!rests || !count || !isfinite(origin) || !isfinite(desired)) return hstrip_nonnegative(desired);
+    size_t base=0, nearest=0;
+    for(size_t i=1;i<count;i++) {
+        if(fabs(rests[i]-origin)<fabs(rests[base]-origin)) base=i;
+        if(fabs(rests[i]-desired)<fabs(rests[nearest]-desired)) nearest=i;
+    }
+    double travel=desired-origin;
+    if(travel==0) return rests[nearest];
+    // The neighbour in the direction of travel, skipping rests at the same offset.
+    size_t next=base;
+    if(travel>0) { for(size_t i=base+1;i<count;i++) if(rests[i]>rests[base]+.5) { next=i; break; } }
+    else { for(size_t i=base;i-->0;) if(rests[i]<rests[base]-.5) { next=i; break; } }
+    if(next==base) return rests[nearest]; // Nothing further that way.
+    if(!(threshold>0)) threshold=.01;
+    double needed=fabs(rests[next]-origin)*threshold;
+    if(fabs(travel)<needed) return rests[nearest==next ? base : nearest];
+    // Committed: never fall back behind the neighbour.
+    if(travel>0) return rests[nearest>next ? nearest : next];
+    return rests[nearest<next ? nearest : next];
+}
+
+/*
+ * A weak magnet for direct manipulation: within `radius` of a resting offset
+ * the strip leans toward it by at most `strength` of the remaining distance.
+ * The mapping stays strictly increasing for strength <= 0.6, so the strip
+ * never moves against the finger; outside the radius it is the identity.
+ */
+static inline double hstrip_magnet(double raw,double rest,double radius,double strength)
+{
+    double d=raw-rest, u;
+    if(!isfinite(raw) || !isfinite(rest) || !(radius>0) || !(strength>0)) return raw;
+    u=fabs(d)/radius;
+    if(u>=1) return raw;
+    if(strength>.6) strength=.6;
+    return raw-d*strength*(1-u)*(1-u);
+}
+
+/*
+ * Index of the column boundary nearest a world x coordinate: 0 is before the
+ * first column, `count` is after the last. `gap` centres the boundary in the
+ * space between neighbours.
+ */
+static inline size_t hstrip_nearest_gap(double world_x,const double *lefts,const double *widths,
+                                        size_t count,double gap)
+{
+    size_t best=count; double distance=INFINITY;
+    if(!lefts || !widths || !isfinite(world_x)) return count;
+    for(size_t i=0;i<=count;i++) {
+        double boundary=i<count ? lefts[i]-gap*.5 : (count ? lefts[count-1]+widths[count-1]+gap*.5 : 0);
+        double d=fabs(boundary-world_x);
+        if(d<distance) { distance=d; best=i; }
+    }
+    return best;
+}
+
+/*
+ * Camera travel after a column of `removed_width` (including its gap) leaves
+ * the strip. Columns to its right slide left by that width; moving the camera
+ * by half makes both sides converge on the hole. A hole entirely left of the
+ * viewport is absorbed completely and one entirely to the right not at all,
+ * so windows the user is looking at never jump.
+ */
+static inline double hstrip_close_shift(double removed_x,double removed_width,
+                                        double offset,double viewport_width)
+{
+    double width=hstrip_nonnegative(removed_width), center=removed_x+width*.5;
+    if(center<=offset) return width;
+    if(center>=offset+viewport_width) return 0;
+    return width*.5;
+}
+
 /* Return a finite, non-negative length. */
 static inline double hstrip_nonnegative(double value)
 {
