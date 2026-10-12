@@ -1,0 +1,140 @@
+diff --git a/src/event_loop.c b/src/event_loop.c
+index 399704e..5189cd8 100644
+--- a/src/event_loop.c
++++ b/src/event_loop.c
+@@ -1114,8 +1114,14 @@ static EVENT_HANDLER(DISPLAY_RESIZED)
+     event_signal_push(SIGNAL_DISPLAY_RESIZED, context);
+ }
+ 
++static EVENT_HANDLER(FIREFOX_WINDOWS_DISCOVER)
++{
++    firefox_discovery_rescan((pid_t)(intptr_t) context);
++}
++
+ static EVENT_HANDLER(MOUSE_DOWN)
+ {
++    firefox_discovery_begin(NULL, false);
+     if (mission_control_is_active())                     goto out;
+     if (g_mouse_state.current_action != MOUSE_MODE_NONE) goto out;
+ 
+@@ -1123,6 +1129,8 @@ static EVENT_HANDLER(MOUSE_DOWN)
+     debug("%s: %.2f, %.2f\n", __FUNCTION__, point.x, point.y);
+ 
+     struct window *window = window_manager_find_window_at_point(&g_window_manager, point);
++    struct application *drag_application = window ? window->application : window_manager_find_application(&g_window_manager, g_process_manager.front_pid);
++    firefox_discovery_begin(drag_application, CGEventGetIntegerValueField(context, kCGMouseEventButtonNumber) == kCGMouseButtonLeft);
+     if (!window || window_check_flag(window, WINDOW_FULLSCREEN)) goto out;
+ 
+     g_mouse_state.window = window;
+@@ -1153,6 +1161,7 @@ out:
+ 
+ static EVENT_HANDLER(MOUSE_UP)
+ {
++    firefox_discovery_end();
+     if (mission_control_is_active()) goto out;
+     if (!g_mouse_state.window)       goto res;
+ 
+@@ -1234,6 +1243,7 @@ out:
+ 
+ static EVENT_HANDLER(MOUSE_DRAGGED)
+ {
++    firefox_discovery_drag();
+     if (mission_control_is_active()) goto out;
+     if (!g_mouse_state.window)       goto out;
+ 
+diff --git a/src/event_loop.h b/src/event_loop.h
+index add0ae4..2364169 100644
+--- a/src/event_loop.h
++++ b/src/event_loop.h
+@@ -17,6 +17,7 @@
+     EVENT_TYPE_ENTRY(WINDOW_MINIMIZED) \
+     EVENT_TYPE_ENTRY(WINDOW_DEMINIMIZED) \
+     EVENT_TYPE_ENTRY(WINDOW_TITLE_CHANGED) \
++    EVENT_TYPE_ENTRY(FIREFOX_WINDOWS_DISCOVER) \
+     EVENT_TYPE_ENTRY(SLS_WINDOW_ORDERED) \
+     EVENT_TYPE_ENTRY(SLS_WINDOW_DESTROYED) \
+     EVENT_TYPE_ENTRY(SLS_SPACE_CREATED) \
+diff --git a/src/manifest.m b/src/manifest.m
+index af3ea7b..8530924 100644
+--- a/src/manifest.m
++++ b/src/manifest.m
+@@ -79,6 +79,7 @@
+ 
+ #include "sa.m"
+ #include "mission_control.c"
++#include "firefox_window_discovery.c"
+ #include "event_loop.c"
+ #include "event_signal.c"
+ #include "workspace.m"
+diff --git a/src/firefox_window_discovery.c b/src/firefox_window_discovery.c
+new file mode 100644
+index 0000000..0237027
+--- /dev/null
++++ b/src/firefox_window_discovery.c
+@@ -0,0 +1,66 @@
++// Firefox tab tear-offs can omit AXCreated. Recover references from AXWindows
++// after a left drag, without restarting the daemon or changing window rules.
++// All state and AX reads below run on the serialized yabai event thread.
++extern struct window_manager g_window_manager;
++static pid_t firefox_discovery_pid;
++static bool firefox_discovery_dragged;
++
++static bool firefox_discovery_is_application(struct application *application)
++{
++    return application && strcasecmp(application->name, "Firefox") == 0;
++}
++
++static void firefox_discovery_begin(struct application *application, bool left_button)
++{
++    firefox_discovery_pid = left_button && firefox_discovery_is_application(application) ? application->pid : 0;
++    firefox_discovery_dragged = false;
++    if (application) debug("firefox-window-discovery: click app=%s pid=%d left=%d armed=%d\n", application->name, application->pid, left_button, firefox_discovery_pid);
++}
++
++static void firefox_discovery_drag(void)
++{
++    if (firefox_discovery_pid) firefox_discovery_dragged = true;
++}
++
++static void firefox_discovery_end(void)
++{
++    pid_t pid = firefox_discovery_pid;
++    bool dragged = firefox_discovery_dragged;
++    firefox_discovery_pid = 0;
++    firefox_discovery_dragged = false;
++    if (!pid || !dragged) return;
++    debug("firefox-window-discovery: scheduling pid=%d after drag\n", pid);
++
++    // The native drag-end event can precede creation of the accessible window.
++    // Retain only the pid across timers: the app may exit before they fire.
++    const double delays[] = {0.0, 0.05, 0.1, 0.15, 0.2};
++    for (unsigned i = 0; i < sizeof(delays) / sizeof(delays[0]); ++i) {
++        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, delays[i] * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
++            event_loop_post(&g_event_loop, FIREFOX_WINDOWS_DISCOVER, (void *)(intptr_t) pid, 0);
++        });
++    }
++}
++
++static void firefox_discovery_rescan(pid_t pid)
++{
++    struct application *application = window_manager_find_application(&g_window_manager, pid);
++    if (!firefox_discovery_is_application(application)) return;
++
++    CFArrayRef windows = application_window_list(application);
++    debug("firefox-window-discovery: scan pid=%d AXWindows=%ld\n", pid, windows ? (long) CFArrayGetCount(windows) : -1L);
++    if (!windows) return;
++
++    for (CFIndex i = 0; i < CFArrayGetCount(windows); ++i) {
++        AXUIElementRef ref = (AXUIElementRef) CFArrayGetValueAtIndex(windows, i);
++        uint32_t wid = ax_window_id(ref);
++        debug("firefox-window-discovery: AX window %u tracked=%d\n", wid, wid ? window_manager_find_window(&g_window_manager, wid) != NULL : 0);
++        if (!wid || window_manager_find_window(&g_window_manager, wid)) continue;
++
++        debug("firefox-window-discovery: recovering %u after drag\n", wid);
++        // Reuse normal creation handling for observation, rules, tiling and
++        // signals. It also rejects stale refs and deduplicates racing events.
++        event_loop_post(&g_event_loop, WINDOW_CREATED, (void *) CFRetain(ref), 0);
++    }
++
++    CFRelease(windows);
++}

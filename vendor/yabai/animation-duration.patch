@@ -1,0 +1,152 @@
+diff --git a/src/osax/common.h b/src/osax/common.h
+index 2fdb8ce..30064b0 100644
+--- a/src/osax/common.h
++++ b/src/osax/common.h
+@@ -4,7 +4,10 @@
+ #define SA_SOCKET_PATH_FMT "/tmp/yabai-sa_%s.socket"
+ #define SA_SOCKET_BUFF_LEN 0x1000
+ 
+-#define OSAX_VERSION                "2.1.29"
++// Bumped from upstream's "2.1.29" so that scripting_addition_check() sees a version
++// mismatch against an already-installed payload and reinstalls this patched one.
++// Bump again after changing payload.m, or the stale bundle is kept as "up to date".
++#define OSAX_VERSION                "2.1.31"
+ 
+ #define OSAX_ATTRIB_DOCK_SPACES     0x01
+ #define OSAX_ATTRIB_DPPM            0x02
+diff --git a/src/osax/payload.m b/src/osax/payload.m
+index b4d6768..32ca76e 100644
+--- a/src/osax/payload.m
++++ b/src/osax/payload.m
+@@ -264,6 +264,92 @@ static bool verify_os_version(NSOperatingSystemVersion os_version)
+     return false;
+ }
+ 
++//
++// LOCAL PATCH -- Dock space-transition animation duration.
++//
++// Dock hardcodes the duration of the space-switch slide as an FMOV immediate
++// (macOS 26: `fmov d0, #0.25` at the call site located by get_fix_animation_pattern).
++// Upstream yabai overwrites that instruction with `movi d0, #0`, which removes the
++// slide for *every* space switch -- cmd+tab, Dock clicks and the numeric
++// mission-control hotkeys included -- and declined to make it configurable
++// (yabai issue #1501).
++//
++// This build rewrites the immediate instead of zeroing it, so the slide survives but
++// finishes sooner. The duration is read at injection time from
++// ~/.config/yabai/space-animation-duration (a single float, in seconds), falling back
++// to SA_SPACE_ANIM_DEFAULT. Retuning therefore needs only a Dock reinject
++// (`sudo yabai --load-sa`), not a rebuild.
++//
++// ARM64's FMOV scalar immediate can only encode +/- n/16 * 2^r for n in [16,31] and
++// r in [-3,4], so the shortest non-zero duration available is 0.125s and the encoder
++// snaps whatever is requested to the nearest representable value. A value of 0 (or
++// less) restores upstream's behaviour and removes the animation entirely.
++//
++
++#define SA_SPACE_ANIM_DEFAULT 0.125
++#define SA_SPACE_ANIM_FILE    "/.config/yabai/space-animation-duration"
++
++static double sa_space_animation_duration(void)
++{
++    double seconds = SA_SPACE_ANIM_DEFAULT;
++
++    const char *home = getenv("HOME");
++    if (!home) return seconds;
++
++    char path[PATH_MAX];
++    snprintf(path, sizeof(path), "%s%s", home, SA_SPACE_ANIM_FILE);
++
++    FILE *handle = fopen(path, "r");
++    if (!handle) return seconds;
++
++    double value;
++    if (fscanf(handle, "%lf", &value) == 1 && value >= 0.0 && value <= 1.0) {
++        seconds = value;
++    } else {
++        NSLog(@"[yabai-sa] %s is unreadable or out of range [0,1]; using %.6fs", path, seconds);
++    }
++
++    fclose(handle);
++    return seconds;
++}
++
++#ifdef __arm64__
++//
++// Encode `fmov d0, #<nearest representable value to seconds>`.
++// The 8-bit immediate abcdefgh expands to a double as
++//   sign = a, exponent = ~b : b*8 : cd, fraction = efgh : 48 zero bits
++// (ARM VFPExpandImm). Only positive values are considered.
++//
++static uint32_t sa_encode_fmov_d0(double seconds, double *encoded)
++{
++    int best_imm8 = -1;
++    double best_delta = 0.0;
++    double best_value = 0.0;
++
++    for (int imm8 = 0; imm8 < 0x80; ++imm8) {
++        int b = (imm8 >> 6) & 1;
++        int c = (imm8 >> 5) & 1;
++        int d = (imm8 >> 4) & 1;
++
++        uint64_t exponent = ((uint64_t)(!b) << 10) | ((uint64_t)(b ? 0xFF : 0x00) << 2) | (c << 1) | d;
++        uint64_t bits     = (exponent << 52) | ((uint64_t)(imm8 & 0xF) << 48);
++
++        double value;
++        memcpy(&value, &bits, sizeof(value));
++
++        double delta = value > seconds ? value - seconds : seconds - value;
++        if (best_imm8 < 0 || delta < best_delta) {
++            best_imm8  = imm8;
++            best_delta = delta;
++            best_value = value;
++        }
++    }
++
++    if (encoded) *encoded = best_value;
++    return 0x1E601000 | ((uint32_t) best_imm8 << 13);
++}
++#endif
++
+ static void init_instances()
+ {
+     NSOperatingSystemVersion os_version = [[NSProcessInfo processInfo] operatingSystemVersion];
+@@ -380,16 +466,34 @@ static void init_instances()
+         NSLog(@"[yabai-sa] failed to get pointer to animation-time..");
+     } else {
+         NSLog(@"[yabai-sa] (0x%llx) animation_time_addr found at address 0x%llX (0x%llx)", baseaddr, animation_time_addr, animation_time_addr - baseaddr);
+-        if (vm_protect(mach_task_self(), page_align(animation_time_addr), vm_page_size, 0, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY) == KERN_SUCCESS) {
+ #ifdef __x86_64__
+-            *(uint64_t *) animation_time_addr = 0x660fefc0660fefc0;
++        //
++        // LOCAL PATCH: the x86_64 write is upstream's unconditional `pxor xmm0, xmm0`
++        // pair, which cannot express a non-zero duration in the same 8 bytes. Skip it
++        // so Intel keeps Dock's stock slide rather than losing it; only arm64 is
++        // retimed below. The address lookup above still runs, so OSAX_ATTRIB_ANIM_TIME
++        // is reported either way and the all-attributes check in sa.m still passes.
++        //
++        NSLog(@"[yabai-sa] animation-time patch SKIPPED on x86_64 (native Space animations preserved)");
+ #elif __arm64__
+-            *(uint32_t *) animation_time_addr = 0x2f00e400;
+-#endif
++        double requested = sa_space_animation_duration();
++        double encoded   = 0.0;
++        uint32_t instruction;
++
++        if (requested <= 0.0) {
++            instruction = 0x2f00e400; // movi d0, #0 -- upstream behaviour, no animation
++        } else {
++            instruction = sa_encode_fmov_d0(requested, &encoded);
++        }
++
++        if (vm_protect(mach_task_self(), page_align(animation_time_addr), vm_page_size, 0, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY) == KERN_SUCCESS) {
++            *(uint32_t *) animation_time_addr = instruction;
+             vm_protect(mach_task_self(), page_align(animation_time_addr), vm_page_size, 0, VM_PROT_READ | VM_PROT_EXECUTE);
++            NSLog(@"[yabai-sa] space-transition animation time set to %.6fs (requested %.6fs, instruction 0x%08X)", encoded, requested, instruction);
+         } else {
+             NSLog(@"[yabai-sa] animation_time_addr vm_protect failed; unable to patch instruction!");
+         }
++#endif
+     }
+ }
+ 

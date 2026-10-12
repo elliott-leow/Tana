@@ -1,0 +1,46 @@
+diff --git a/src/osax/common.h b/src/osax/common.h
+index 2fdb8ce..29b4a82 100644
+--- a/src/osax/common.h
++++ b/src/osax/common.h
+@@ -4,7 +4,10 @@
+ #define SA_SOCKET_PATH_FMT "/tmp/yabai-sa_%s.socket"
+ #define SA_SOCKET_BUFF_LEN 0x1000
+ 
+-#define OSAX_VERSION                "2.1.29"
++// Bumped from upstream's "2.1.29" so that scripting_addition_check() sees a version
++// mismatch against an already-installed stock payload and reinstalls this patched one.
++// Without this bump the old animation-killing payload would be kept as "up to date".
++#define OSAX_VERSION                "2.1.30"
+ 
+ #define OSAX_ATTRIB_DOCK_SPACES     0x01
+ #define OSAX_ATTRIB_DPPM            0x02
+diff --git a/src/osax/payload.m b/src/osax/payload.m
+index b4d6768..03d2e9b 100644
+--- a/src/osax/payload.m
++++ b/src/osax/payload.m
+@@ -380,16 +380,15 @@ static void init_instances()
+         NSLog(@"[yabai-sa] failed to get pointer to animation-time..");
+     } else {
+         NSLog(@"[yabai-sa] (0x%llx) animation_time_addr found at address 0x%llX (0x%llx)", baseaddr, animation_time_addr, animation_time_addr - baseaddr);
+-        if (vm_protect(mach_task_self(), page_align(animation_time_addr), vm_page_size, 0, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY) == KERN_SUCCESS) {
+-#ifdef __x86_64__
+-            *(uint64_t *) animation_time_addr = 0x660fefc0660fefc0;
+-#elif __arm64__
+-            *(uint32_t *) animation_time_addr = 0x2f00e400;
+-#endif
+-            vm_protect(mach_task_self(), page_align(animation_time_addr), vm_page_size, 0, VM_PROT_READ | VM_PROT_EXECUTE);
+-        } else {
+-            NSLog(@"[yabai-sa] animation_time_addr vm_protect failed; unable to patch instruction!");
+-        }
++        //
++        // LOCAL PATCH: upstream zeroes Dock's space-transition animation time here.
++        // That instruction governs *every* space switch, so it also removes the slide
++        // for native ones (cmd+tab, Dock clicks, the numeric mission-control hotkeys);
++        // upstream declined to make it optional (yabai issue #1501). The address lookup
++        // above is deliberately kept so OSAX_ATTRIB_ANIM_TIME is still reported and the
++        // all-attributes check in sa.m still passes -- only the write is skipped.
++        //
++        NSLog(@"[yabai-sa] animation-time patch SKIPPED (local build: native Space animations preserved)");
+     }
+ }
+ 

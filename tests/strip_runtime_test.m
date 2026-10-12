@@ -1,0 +1,204 @@
+/* Exercise the production layout/renderer with deterministic OS boundaries.
+ * No Accessibility permission, real windows, or running daemon are needed. */
+#import <Cocoa/Cocoa.h>
+#include <assert.h>
+#include <stdio.h>
+#include "../src/strip_columns.h"
+
+#define VIEW_STRIP 1
+#define VIEW_IS_DIRTY 1
+#define LAYER_AUTO 0
+#define LAYER_BELOW -1
+#define LAYER_NORMAL 0
+#define WINDOW_MINIMIZE 1
+#define WINDOW_FULLSCREEN 2
+#define table_for(declaration,table,body) for(int slot=0;slot<4;slot++) { declaration=&windows[slot]; body; }
+#define AX_ENHANCED_UI_WORKAROUND(ref, body) do { (void)(ref); body; } while(0)
+struct area { double x,y,w,h; };
+struct application { int ref; bool is_hidden; };
+struct window {
+    uint32_t id; struct application *application;
+    CGRect frame,strip_last_frame;
+    uint64_t strip_column;
+    double strip_weight,strip_width,strip_height,strip_world_x,strip_world_y;
+    double strip_from_x,strip_from_y,strip_from_width,strip_from_height;
+    double strip_start,strip_last_offset,strip_size_sent_at;
+    bool strip_initialized,strip_full_width,strip_size_pending;
+    int layer;
+    bool floating,strip_float_animating,strip_close_pending;
+    CGRect strip_float_from,strip_float_last,strip_float_target;
+    double strip_float_start,strip_close_start;
+    float strip_close_alpha;
+};
+struct window_node { int window_count; uint32_t window_list[1]; struct window_node *next; struct area area; };
+struct view { int layout,window_gap; struct window_node *root; double strip_offset; bool strip_scrolling; };
+static struct { int unused; } g_window_manager;
+static struct { struct window *window; CGPoint down_location; } g_mouse_state;
+static int g_connection;
+static bool hwm_ready=true,hwm_paused,hwm_overview_active,hwm_state_pending,hwm_backend_ok=true;
+static bool __pending_gesture;
+static uint32_t hwm_drag_window,hwm_close_source,hwm_close_target;
+static double hwm_duration=.24,hwm_close_screen_x,hwm_close_time,hwm_last_input;
+static uint64_t hwm_move_failures,hwm_resize_operations;
+static struct window windows[4];
+static struct window_node nodes[4];
+static struct application application;
+static struct view view;
+static CGRect actual[4];
+static double clock_now=10;
+static int ax_calls,moves,disable_calls,update_depth;
+static bool move_fails;
+static float alphas[4];
+static int close_calls;
+static double hwm_now(void) { return clock_now; }
+static double horizontal_ease(double p) { return hstrip_ease(p); }
+static void hwm_wake(void) {}
+static CGRect hwm_bounds(struct view *v) { (void)v; return CGRectMake(12,51,1200,900); }
+static double hwm_offset(struct view *v,double now) { (void)now; return v->strip_offset; }
+static void hwm_scroll(struct view *v,double x,bool animate) { (void)animate; v->strip_offset=x; }
+static struct window_node *window_node_find_first_leaf(struct window_node *n) { return n; }
+static struct window_node *window_node_find_next_leaf(struct window_node *n) { return n->next; }
+static struct window *window_manager_find_window(void *manager,uint32_t id) { (void)manager; return id>=1 && id<=4 ? &windows[id-1] : NULL; }
+static struct view *window_manager_find_managed_window(void *manager,struct window *w) { (void)manager; return w->floating?NULL:&view; }
+static bool window_check_flag(struct window *w,int flag) { (void)w; (void)flag; return false; }
+static CGError SLSGetWindowAlpha(int connection,uint32_t id,float *alpha) { (void)connection; *alpha=alphas[id-1]; return kCGErrorSuccess; }
+static bool scripting_addition_set_opacity(uint32_t id,float alpha,double duration) { (void)duration; alphas[id-1]=alpha; return true; }
+static bool window_manager_close_window(struct window *w) { (void)w; ++close_calls; return false; }
+static struct window_node *view_find_window_node(struct view *v,uint32_t id) { for(struct window_node *n=v->root;n;n=n->next) if(n->window_list[0]==id) return n; return NULL; }
+static void view_clear_flag(struct view *v,int flag) { (void)v; (void)flag; }
+static CGError SLSGetWindowBounds(int connection,uint32_t id,CGRect *frame) { (void)connection; *frame=actual[id-1]; return kCGErrorSuccess; }
+static void SLSGetCurrentCursorLocation(int connection,CGPoint *point) { (void)connection; *point=CGPointZero; }
+static void SLSDisableUpdate(int connection) { (void)connection; assert(update_depth==0); ++update_depth; ++disable_calls; }
+static void SLSReenableUpdate(int connection) { (void)connection; assert(update_depth==1); --update_depth; }
+static bool scripting_addition_set_layer(uint32_t id,int layer) { (void)id; (void)layer; return true; }
+static bool scripting_addition_move_window(uint32_t id,double x,double y) { ++moves; if(move_fails) return false; actual[id-1].origin=CGPointMake(x,y); return true; }
+static void window_manager_set_window_frame(struct window *w,double x,double y,double width,double height) { assert(update_depth==0); ++ax_calls; actual[w->id-1]=CGRectMake(x,y,width,height); }
+static void window_manager_resize_window(struct window *w,double width,double height) { assert(update_depth==0); ++ax_calls; actual[w->id-1].size=CGSizeMake(width,height); }
+static void hwm_column_width(struct view *v,struct window *w,double width) { (void)v; w->strip_width=width; }
+#include "../src/strip_layout.m"
+#include "../src/strip_renderer.m"
+#include "../src/window_transitions.m"
+
+static void reset(void)
+{
+    memset(windows,0,sizeof(windows)); memset(nodes,0,sizeof(nodes));
+    view=(struct view){.layout=VIEW_STRIP,.window_gap=12,.root=nodes};
+    clock_now=10; hwm_last_input=0; __pending_gesture=false;
+    hwm_move_failures=0; hwm_resize_operations=0; ax_calls=0; moves=0; disable_calls=0; update_depth=0;
+    hwm_backend_ok=true; move_fails=false;
+    g_mouse_state.window=NULL; close_calls=0;
+    for(int i=0;i<4;i++) {
+        windows[i].id=i+1; windows[i].application=&application;
+        windows[i].frame=actual[i]=CGRectMake(100+i*80,100,400,600);
+        windows[i].strip_width=400;
+        alphas[i]=.85;
+        nodes[i].window_count=1; nodes[i].window_list[0]=i+1;
+        nodes[i].next=i<3 ? &nodes[i+1] : NULL;
+    }
+    hwm_layout(&view,false); hwm_render(&view,clock_now);
+    clock_now+=1; hwm_render(&view,clock_now);
+    ax_calls=0; moves=0; disable_calls=0; hwm_resize_operations=0;
+}
+static void test_pan_and_late_notifications(void)
+{
+    reset(); __pending_gesture=true;
+    for(int step=1;step<=80;step++) {
+        view.strip_offset=step*11.5;
+        clock_now+=1.0/120;
+        hwm_last_input=clock_now;
+        hwm_render(&view,clock_now);
+        for(int i=0;i<4;i++) {
+            CGRect cached=windows[i].strip_last_frame;
+            actual[i].origin.x+=44; // A stale app notification during live input.
+            assert(horizontal_window_moved(&windows[i]));
+            assert(horizontal_window_changed(&windows[i],&view,false));
+            assert(CGRectEqualToRect(cached,windows[i].strip_last_frame));
+            actual[i]=cached;
+        }
+    }
+    assert(ax_calls==0 && hwm_resize_operations==0);
+    assert(disable_calls==80 && update_depth==0); // One compositor batch per pan frame.
+    // A settled drift correction still works and still does not resize.
+    __pending_gesture=false; clock_now+=1;
+    actual[0].origin.x+=44;
+    assert(horizontal_window_changed(&windows[0],&view,false));
+    assert(!CGRectIsNull(windows[0].strip_last_frame));
+    hwm_render(&view,clock_now);
+    assert(actual[0].origin.x==round(12-view.strip_offset));
+    assert(ax_calls==0 && hwm_resize_operations==0);
+}
+static void test_retarget_during_scroll(void)
+{
+    reset(); view.strip_offset=200; hwm_render(&view,clock_now);
+    double source=windows[0].strip_last_frame.origin.x-12+windows[0].strip_last_offset;
+    view.strip_offset=250; // Input advanced since the last displayed frame.
+    windows[0].strip_width=650;
+    hwm_layout(&view,true);
+    assert(windows[0].strip_from_x==source);
+    assert(windows[0].strip_from_width==400);
+    clock_now+=.12; hwm_render(&view,clock_now);
+    double shown=windows[0].strip_last_frame.size.width;
+    assert(shown>400 && shown<650);
+    windows[0].strip_width=300;
+    hwm_layout(&view,true);
+    assert(windows[0].strip_from_width==shown); // Reversal starts where it was drawn.
+    clock_now+=1; hwm_render(&view,clock_now);
+    assert(windows[0].strip_last_frame.size.width==300);
+    assert(update_depth==0);
+}
+static void test_new_window_and_dynamic_stack(void)
+{
+    reset();
+    windows[3].strip_initialized=false;
+    actual[3]=CGRectMake(700,250,450,400);
+    windows[2].strip_column=3; windows[3].strip_column=3;
+    hwm_layout(&view,true);
+    assert(windows[3].strip_from_x==688 && windows[3].strip_from_y==199);
+    assert(windows[3].strip_from_width==450);
+    assert(windows[2].strip_world_x==windows[3].strip_world_x);
+    assert(windows[3].strip_world_y>windows[2].strip_world_y);
+    clock_now+=.12; hwm_render(&view,clock_now);
+    assert(windows[3].strip_last_frame.size.width>400 && windows[3].strip_last_frame.size.width<450);
+    clock_now+=1; hwm_render(&view,clock_now);
+    assert(windows[3].strip_last_frame.size.height==444);
+}
+static void test_failure_releases_compositor(void)
+{
+    reset(); view.strip_offset=200; move_fails=true;
+    assert(!hwm_render(&view,clock_now));
+    assert(update_depth==0 && hwm_move_failures==1 && !hwm_backend_ok);
+}
+static void test_floating_reversal_and_close_refusal(void)
+{
+    reset(); struct window *w=&windows[0]; w->floating=true;
+    CGRect target=CGRectMake(300,180,800,650);
+    CGRect original=actual[0];
+    hwm_float_to(w,target);
+    assert(CGRectEqualToRect(w->strip_float_from,original));
+    clock_now+=.12; assert(hwm_render_floating(clock_now));
+    assert(actual[0].size.width>original.size.width && actual[0].size.width<target.size.width);
+    CGRect mid=actual[0];
+    hwm_float_to(w,original);
+    assert(CGRectEqualToRect(w->strip_float_from,mid));
+    clock_now+=1; assert(!hwm_render_floating(clock_now));
+    assert(CGRectEqualToRect(actual[0],original));
+    hwm_float_to(w,target); g_mouse_state.window=w;
+    assert(!hwm_render_floating(clock_now)); // Direct manipulation takes ownership.
+    assert(!w->strip_float_animating);
+    g_mouse_state.window=NULL;
+    hwm_close_animated(w); clock_now+=.07;
+    assert(hwm_render_closing(clock_now));
+    assert(alphas[0]>0 && alphas[0]<.85 && close_calls==0);
+    clock_now+=.1; assert(!hwm_render_closing(clock_now));
+    assert(close_calls==1 && fabs(alphas[0]-.85)<1e-6); // Refused close remains visible.
+    hwm_close_animated(w); clock_now+=.07; hwm_render_closing(clock_now);
+    hwm_cancel_closing();
+    assert(!w->strip_close_pending && fabs(alphas[0]-.85)<1e-6 && close_calls==1);
+}
+int main(void)
+{
+    test_pan_and_late_notifications(); test_retarget_during_scroll();
+    test_new_window_and_dynamic_stack(); test_failure_releases_compositor();
+    test_floating_reversal_and_close_refusal();
+    puts("strip runtime tests passed");
+}

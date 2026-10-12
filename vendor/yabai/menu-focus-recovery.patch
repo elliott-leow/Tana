@@ -1,0 +1,134 @@
+diff --git a/src/application.c b/src/application.c
+index 2a55b58..c4c3a07 100644
+--- a/src/application.c
++++ b/src/application.c
+@@ -17,9 +17,9 @@ static OBSERVER_CALLBACK(application_notification_handler)
+     } else if (CFEqual(notification, kAXTitleChangedNotification)) {
+         event_loop_post(&g_event_loop, WINDOW_TITLE_CHANGED, (void *)(intptr_t) ax_window_id(element), 0);
+     } else if (CFEqual(notification, kAXMenuOpenedNotification)) {
+-        event_loop_post(&g_event_loop, MENU_OPENED, (void *)(intptr_t) ax_window_id(element), 0);
++        event_loop_post(&g_event_loop, MENU_OPENED, (void *) CFRetain(element), 0);
+     } else if (CFEqual(notification, kAXMenuClosedNotification)) {
+-        event_loop_post(&g_event_loop, MENU_CLOSED, NULL, 0);
++        event_loop_post(&g_event_loop, MENU_CLOSED, (void *) CFRetain(element), 0);
+     } else if (CFEqual(notification, kAXWindowMiniaturizedNotification)) {
+         event_loop_post(&g_event_loop, WINDOW_MINIMIZED, context, 0);
+     } else if (CFEqual(notification, kAXWindowDeminiaturizedNotification)) {
+diff --git a/src/event_loop.c b/src/event_loop.c
+index 5189cd8..b4e47dd 100644
+--- a/src/event_loop.c
++++ b/src/event_loop.c
+@@ -1352,9 +1352,12 @@ out:
+     CFRelease(context);
+ }
+ 
++#include "menu_focus_recovery.c"
++
+ static EVENT_HANDLER(MOUSE_MOVED)
+ {
+     if (g_window_manager.ffm_mode == FFM_DISABLED) goto out;
++    if (menu_focus_suppressed()) goto out;
+     if (mission_control_is_active())               goto out;
+     if (g_mouse_state.ffm_window_id)               goto out;
+ 
+@@ -1565,30 +1568,16 @@ static EVENT_HANDLER(DOCK_DID_RESTART)
+     event_signal_push(SIGNAL_DOCK_DID_RESTART, NULL);
+ }
+ 
+-static enum ffm_mode ffm_value;
+-static int is_menu_open = 0;
+-
+ static EVENT_HANDLER(MENU_OPENED)
+ {
+-    debug("%s\n", __FUNCTION__);
+-    ++is_menu_open;
+-
+-    if (is_menu_open == 1) {
+-        ffm_value = g_window_manager.ffm_mode;
+-        g_window_manager.ffm_mode = FFM_DISABLED;
+-    }
++    menu_focus_open(context);
++    CFRelease(context);
+ }
+ 
+ static EVENT_HANDLER(MENU_CLOSED)
+ {
+-    debug("%s\n", __FUNCTION__);
+-    --is_menu_open;
+-
+-    if (is_menu_open == 0) {
+-        g_window_manager.ffm_mode = ffm_value;
+-    } else if (is_menu_open < 0) {
+-        is_menu_open = 0;
+-    }
++    menu_focus_close(context);
++    CFRelease(context);
+ }
+ 
+ static EVENT_HANDLER(MENU_BAR_HIDDEN_CHANGED)
+diff --git a/src/menu_focus_recovery.c b/src/menu_focus_recovery.c
+new file mode 100644
+--- /dev/null
++++ b/src/menu_focus_recovery.c
+@@ -0,0 +1,61 @@
++// Keep the user's FFM preference independent of temporary menu suppression.
++// AX references identify menus, so duplicate opens/unmatched closes cannot corrupt
++// a counter. Reconcile on pointer movement, at most four times per second.
++#include <errno.h>
++#include <signal.h>
++static CFMutableArrayRef ffm_menus;
++static uint64_t ffm_menu_check_time;
++
++static void menu_focus_open(AXUIElementRef menu)
++{
++    if (!ffm_menus) ffm_menus = CFArrayCreateMutable(NULL, 0, &kCFTypeArrayCallBacks);
++    CFRange range = CFRangeMake(0, CFArrayGetCount(ffm_menus));
++    if (!CFArrayContainsValue(ffm_menus, range, menu)) {
++        CFArrayAppendValue(ffm_menus, menu);
++        debug("menu-focus-recovery: suppressing (%ld menus)\n", CFArrayGetCount(ffm_menus));
++    }
++    ffm_menu_check_time = read_os_timer();
++}
++
++static void menu_focus_close(AXUIElementRef menu)
++{
++    if (!ffm_menus) return;
++    CFIndex index = CFArrayGetFirstIndexOfValue(ffm_menus, CFRangeMake(0, CFArrayGetCount(ffm_menus)), menu);
++    if (index != kCFNotFound) CFArrayRemoveValueAtIndex(ffm_menus, index);
++    debug("menu-focus-recovery: close (%ld menus)\n", CFArrayGetCount(ffm_menus));
++}
++
++static bool menu_focus_suppressed(void)
++{
++    if (!ffm_menus || !CFArrayGetCount(ffm_menus)) return false;
++    uint64_t now = read_os_timer();
++    if ((double)(now - ffm_menu_check_time) / read_os_freq() < 0.25) return true;
++    ffm_menu_check_time = now;
++    for (CFIndex i = CFArrayGetCount(ffm_menus); i-- > 0;) {
++        AXUIElementRef menu = (AXUIElementRef) CFArrayGetValueAtIndex(ffm_menus, i);
++        pid_t owner = 0;
++        AXError owner_error = AXUIElementGetPid(menu, &owner);
++        bool gone = owner_error == kAXErrorInvalidUIElement;
++        if (owner_error == kAXErrorSuccess && owner > 0 &&
++            kill(owner, 0) == -1 && errno == ESRCH) {
++            gone = true;
++            debug("menu-focus-recovery: owner exited %d\n", owner);
++        }
++        uint32_t wid = 0;
++        if (!gone) {
++            CFTypeRef role = NULL;
++            AXError error = AXUIElementCopyAttributeValue(menu, kAXRoleAttribute, &role);
++            if (role) CFRelease(role);
++            gone = error == kAXErrorInvalidUIElement;
++            wid = ax_window_id(menu);
++            uint8_t ordered = 1;
++            if (wid && SLSWindowIsOrderedIn(g_connection, wid, &ordered) == kCGErrorSuccess && !ordered) gone = true;
++        }
++        // Transient AX/SkyLight failures are not evidence that a menu closed.
++        if (gone) {
++            CFArrayRemoveValueAtIndex(ffm_menus, i);
++            debug("menu-focus-recovery: cleared stale menu %u (%ld remain)\n", wid, CFArrayGetCount(ffm_menus));
++        }
++    }
++    return CFArrayGetCount(ffm_menus) != 0;
++}
